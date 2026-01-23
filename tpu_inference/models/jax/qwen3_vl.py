@@ -1,3 +1,4 @@
+import functools
 import math
 from functools import partial
 from typing import List, Literal, NamedTuple, Optional, Tuple, TypedDict, Union
@@ -16,6 +17,7 @@ from tpu_inference.layers.common.attention_interface import (
     # TODO: Text attention should use ragged pagedattention
 )
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
+from tpu_inference.layers.jax.rope_interface import apply_rope
 from tpu_inference.logger import init_logger
 from tpu_inference.models.jax.utils.multi_modal_utils import (
     merge_multimodal_embeddings,
@@ -25,11 +27,43 @@ from tpu_inference.models.jax.utils.weight_utils import (
     load_hf_weights,
 )
 
+# TODO: Potential code consolidation with qwen3.py
+# The following Qwen3-VL components are architecturally similar to Qwen3:
+# - Qwen3VLTextMLP ~ Qwen3MLP (identical SwiGLU structure)
+# - Qwen3VLTextDecoderLayer ~ Qwen3DecoderLayer (same pre-norm transformer block)
+# - RMSNorm: Now uses nnx.RMSNorm directly (Phase 1.1 complete)
+# - RoPE: Now uses shared rope_interface.apply_rope with interleaved_mrope (Phase 1.2 complete)
+# The main differences are:
+# - Interleaved MRoPE (3D positions) vs standard RoPE
+# - DeepStack injection in decoder layers
+# - Q/K normalization in attention (qk_norm)
+
 logger = init_logger(__name__)
 
 init_fn = nnx.initializers.uniform()
 
 DEFAULT_BLOCK_K_MAJOR = 128
+
+
+# =============================================================================
+# Phase 4: MRoPE Frequency Caching
+# =============================================================================
+
+
+@functools.lru_cache(maxsize=32)
+def _get_cached_inv_freq(dim: int, rope_theta: float) -> Tuple[float, ...]:
+    """Cache inverse frequencies for common configurations.
+
+    Returns a tuple (hashable) that can be converted to jax.Array when needed.
+    """
+    inv_freq = 1.0 / (rope_theta ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
+    return tuple(inv_freq.tolist())
+
+
+def get_inv_freq(dim: int, rope_theta: float) -> jax.Array:
+    """Get inverse frequencies, using cache for common configurations."""
+    cached = _get_cached_inv_freq(dim, rope_theta)
+    return jnp.array(cached, dtype=jnp.float32)
 
 
 class _Qwen3VLConfigAdapter:
@@ -240,16 +274,24 @@ def get_mrope_input_positions(
         else:
             ed_video = len(input_tokens) + 1
 
-        if ed_image < ed_video:
+        # Determine which modality comes first in the token sequence
+        # Break early if no more tokens found (extra grids are ignored)
+        if ed_image > len(input_tokens) and ed_video > len(input_tokens):
+            break
+
+        if ed_image <= ed_video and remain_images > 0:
             t, h, w = image_grid_thw[image_index]
             image_index += 1
             remain_images -= 1
             ed = ed_image
-        else:
-            t, h, w = video_grid_thw[video_index]  # t=1
+        elif remain_videos > 0:
+            t, h, w = video_grid_thw[video_index]
             video_index += 1
             remain_videos -= 1
             ed = ed_video
+        else:
+            # No more grids to process, break the loop
+            break
 
         # t would always be 1
         llm_grid_t = t
@@ -330,142 +372,6 @@ def apply_interleaved_mrope(
     return result
 
 
-class Qwen3VLTextRMSNorm(nnx.Module):
-    def __init__(
-        self,
-        hidden_size: int,
-        eps: float = 1e-6,
-        dtype: jnp.dtype = jnp.bfloat16,
-    ):
-        self.weight = nnx.Param(jnp.ones(hidden_size, dtype=dtype))
-        self.variance_epsilon = eps
-
-    def __call__(self, hidden_states: jax.Array) -> jax.Array:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.astype(jnp.float32)
-        variance = jnp.mean(jnp.square(hidden_states), axis=-1, keepdims=True)
-        hidden_states = hidden_states * jax.lax.rsqrt(variance + self.variance_epsilon)
-        return self.weight.value * hidden_states.astype(input_dtype)
-
-
-def rotate_half(x: jax.Array) -> jax.Array:
-    """Rotate half the hidden dims of the input for RoPE."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return jnp.concatenate([-x2, x1], axis=-1)
-
-
-def apply_rotary_pos_emb_thd_padded(
-    x: jax.Array,          # (T, H, padded_dim)
-    cos: jax.Array,        # (bs, T, head_dim) or (T, head_dim)
-    sin: jax.Array,        # (bs, T, head_dim) or (T, head_dim)
-    head_dim: int,         # head_dim_original
-) -> jax.Array:
-    """Match HF/PyTorch RoPE application on Q/K, but with padded head_dim support. The batch size is fake, so packing would be required?"""
-    x_dtype = x.dtype
-    x_f = x.astype(jnp.float32)
-
-    # Normalize cos/sin shapes to (T, head_dim)
-    if cos.ndim == 3:
-        # (bs, T, head_dim) -> (T, head_dim).
-        cos = cos[0]
-        sin = sin[0]
-
-    cos_f = cos.astype(jnp.float32)[:, None, :]  # (T, 1, head_dim)
-    sin_f = sin.astype(jnp.float32)[:, None, :]  # (T, 1, head_dim)
-
-    # Rotate only the real (unpadded) head_dim
-    x_main = x_f[..., :head_dim]  # (T, H, head_dim)
-    x_rot = rotate_half(x_main)   # uses split-half rotate like HF
-    out_main = (x_main * cos_f) + (x_rot * sin_f)
-
-    # Reconstruct padded output: padded dims must be zeros (equivalent to "no dims exist" in PyTorch)
-    if x.shape[-1] > head_dim:
-        out = jnp.zeros_like(x_f)
-        out = out.at[..., :head_dim].set(out_main)
-    else:
-        out = out_main
-
-    return out.astype(x_dtype)
-
-
-class Qwen3VLTextRotaryEmbedding(nnx.Module):
-    """
-    Multimodal Rotary Position Embedding (MRoPE) for Qwen3VL text model.
-    Supports 3D position encoding with temporal, height, and width dimensions.
-    """
-
-    def __init__(
-        self,
-        dim: int,
-        max_position_embeddings: int = 128000,
-        rope_theta: float = 5000000.0,
-        rope_type: str = "default",
-        mrope_section: List[int] = None,
-    ):
-        """
-        Args:
-            dim: Head dimension
-            max_position_embeddings: Maximum sequence length
-            rope_theta: Base frequency for RoPE
-            rope_type: Type of RoPE initialization ("default" for now)
-            mrope_section: Section sizes for MRoPE interleaving [T_dim, H_dim, W_dim]
-        """
-        self.max_seq_len_cached = max_position_embeddings
-        self.original_max_seq_len = max_position_embeddings
-        self.rope_type = rope_type
-
-        if rope_type != "default":
-            raise NotImplementedError(f"RoPE type '{rope_type}' not yet implemented")
-
-        self.dim = dim
-        self.rope_theta = rope_theta
-        # NOTE: We could materialize inv_freq post-load (initialize_cache).
-
-        # MRoPE section for interleaving [T_dim, H_dim, W_dim]
-        # Must sum to dim // 2 = 64
-        self.mrope_section = mrope_section if mrope_section is not None else [24, 20, 20]
-
-    def __call__(
-        self,
-        position_ids: jax.Array,
-    ) -> Tuple[jax.Array, jax.Array]:
-        """
-        Compute cos/sin embeddings from 3D position IDs.
-
-        Args:
-            position_ids: Position IDs of shape (3, seq_len) or (3, bs, seq_len)
-                          where dim 0 is [T, H, W] positions
-
-        Returns:
-            cos: Cosine embeddings of shape (bs, seq_len, dim)
-            sin: Sine embeddings of shape (bs, seq_len, dim)
-        """
-        # Handle both (3, seq_len) and (3, bs, seq_len) inputs
-        if position_ids.ndim == 2:
-            # (3, seq_len) -> (3, 1, seq_len)
-            position_ids = position_ids[:, None, :]
-
-        # position_ids: (3, bs, seq_len)
-        # inv_freq: (dim // 2,)
-        # freqs: (3, bs, seq_len, dim // 2)
-        inv_freq = 1.0 / (
-            self.rope_theta ** (jnp.arange(0, self.dim, 2, dtype=jnp.float32) / self.dim)
-        )
-        freqs = position_ids[:, :, :, None].astype(jnp.float32) * inv_freq[None, None, None, :]
-
-        # Apply MRoPE interleaving: (3, bs, seq_len, dim//2) -> (bs, seq_len, dim//2)
-        freqs = apply_interleaved_mrope(freqs, self.mrope_section)
-        # `apply_rotary_pos_emb` uses `rotate_half` on the full head dim, so
-        # duplicate the half-dim freqs to produce (bs, seq_len, dim).
-        freqs = jnp.concatenate([freqs, freqs], axis=-1)
-
-        cos = jnp.cos(freqs)
-        sin = jnp.sin(freqs)
-
-        return cos.astype(jnp.bfloat16), sin.astype(jnp.bfloat16)
-
-
 class Qwen3VLTextAttention(nnx.Module):
     def __init__(
         self,
@@ -487,17 +393,12 @@ class Qwen3VLTextAttention(nnx.Module):
                                          self.num_heads)
         self.head_dim = utils.get_padded_head_dim(self.head_dim_original)
 
-        mrope_section = None
-        if self.rope_scaling is not None:
-            mrope_section = self.rope_scaling.get("mrope_section", [24, 20, 20]) # should be this always for dense
-
-        self.rotary_emb = Qwen3VLTextRotaryEmbedding(
-            dim=self.head_dim_original,
-            max_position_embeddings=getattr(config, "max_position_embeddings", 128000),
-            rope_theta=self.rope_theta,
-            rope_type="default",
-            mrope_section=mrope_section,
-        )
+        # Ensure rope_scaling has mrope_section for interleaved M-RoPE
+        if self.rope_scaling is None:
+            self.rope_scaling = {"mrope_section": [24, 20, 20]}
+        elif "mrope_section" not in self.rope_scaling:
+            self.rope_scaling = dict(self.rope_scaling)
+            self.rope_scaling["mrope_section"] = [24, 20, 20]
 
         sharding_size = mesh.shape["model"]
         self.num_heads = utils.get_padded_num_heads(self.num_heads,
@@ -514,7 +415,12 @@ class Qwen3VLTextAttention(nnx.Module):
             kernel_init=nnx.with_partitioning(init_fn, (None, "model", None)),
             rngs=rngs,
         )
-        self.q_norm = Qwen3VLTextRMSNorm(self.head_dim, eps=self.rms_norm_eps, dtype=dtype)
+        self.q_norm = nnx.RMSNorm(
+            self.head_dim,
+            epsilon=self.rms_norm_eps,
+            param_dtype=dtype,
+            rngs=rngs,
+        )
 
         self.k_proj = nnx.Einsum(
             "TD,DKH->TKH",
@@ -523,7 +429,12 @@ class Qwen3VLTextAttention(nnx.Module):
             kernel_init=nnx.with_partitioning(init_fn, (None, "model", None)),
             rngs=rngs,
         )
-        self.k_norm = Qwen3VLTextRMSNorm(self.head_dim, eps=self.rms_norm_eps, dtype=dtype)
+        self.k_norm = nnx.RMSNorm(
+            self.head_dim,
+            epsilon=self.rms_norm_eps,
+            param_dtype=dtype,
+            rngs=rngs,
+        )
 
         self.v_proj = nnx.Einsum(
             "TD,DKH->TKH",
@@ -567,10 +478,19 @@ class Qwen3VLTextAttention(nnx.Module):
             # Expand vanilla positions to (3, T) for text-only
             pos = jnp.broadcast_to(pos[None, :], (3, pos.shape[0]))
 
-        cos, sin = self.rotary_emb(pos)  # (bs, T, head_dim_original)
-
-        q = apply_rotary_pos_emb_thd_padded(q, cos, sin, self.head_dim_original)
-        k = apply_rotary_pos_emb_thd_padded(k, cos, sin, self.head_dim_original)
+        # Apply interleaved M-RoPE using the shared rope_interface
+        q = apply_rope(
+            q, pos, self.head_dim_original,
+            rope_theta=self.rope_theta,
+            rope_scaling=self.rope_scaling,
+            interleaved_mrope=True,
+        )
+        k = apply_rope(
+            k, pos, self.head_dim_original,
+            rope_theta=self.rope_theta,
+            rope_scaling=self.rope_scaling,
+            interleaved_mrope=True,
+        )
 
         v = self.v_proj(hidden_states)
         q_scale = k_scale = v_scale = None
@@ -597,6 +517,12 @@ class Qwen3VLTextAttention(nnx.Module):
 
 
 class Qwen3VLTextMLP(nnx.Module):
+    """SwiGLU MLP for Qwen3-VL text decoder.
+
+    Note: This is architecturally identical to Qwen3MLP in qwen3.py.
+    Future refactoring could consolidate these implementations.
+    """
+
     def __init__(
         self,
         hidden_size: int,
@@ -656,12 +582,18 @@ class Qwen3VLTextDecoderLayer(nnx.Module):
             hidden_act=getattr(config, "hidden_act", "silu"),
             dtype=dtype,
         )
-        self.input_layernorm = Qwen3VLTextRMSNorm(hidden_size,
-                                                  eps=rms_norm_eps,
-                                                  dtype=dtype)
-        self.post_attention_layernorm = Qwen3VLTextRMSNorm(hidden_size,
-                                                           eps=rms_norm_eps,
-                                                           dtype=dtype)
+        self.input_layernorm = nnx.RMSNorm(
+            hidden_size,
+            epsilon=rms_norm_eps,
+            param_dtype=dtype,
+            rngs=rngs,
+        )
+        self.post_attention_layernorm = nnx.RMSNorm(
+            hidden_size,
+            epsilon=rms_norm_eps,
+            param_dtype=dtype,
+            rngs=rngs,
+        )
 
     def __call__(
         self,
@@ -867,11 +799,12 @@ class Qwen3VLVisionAttention(nnx.Module):
         )
 
         # Qwen3VL's Vision Transformer uses full bidirectional attention.
+        # Note: vmem_limit increased to 256MB for larger image sequences
         self.flash_attention = sharded_flash_attention(
             mesh=mesh,
             causal=False,
             sm_scale=1.0 / math.sqrt(self.head_dim),
-            vmem_limit_bytes=128 * 1024 * 1024,
+            vmem_limit_bytes=256 * 1024 * 1024,
         )
 
     def __call__(
@@ -1064,7 +997,15 @@ class Qwen3VLVisionPatchMerger(nnx.Module):
 
 
 class Qwen3VLVisionTransformer(nnx.Module):
-    """Vision Transformer for Qwen3VL with DeepStack support."""
+    """Vision Transformer for Qwen3VL with DeepStack support.
+
+    Vision encoder sharding strategy:
+    - patch_embed.proj.kernel: P(None, None, None, None, "model")
+    - blocks.*.attn.qkv_proj.kernel: P(None, "model")
+    - blocks.*.attn.proj.kernel: P("model", None)
+    - blocks.*.mlp.fc1.kernel: P(None, "model")
+    - blocks.*.mlp.fc2.kernel: P("model", None)
+    """
 
     def __init__(
         self,
@@ -1492,10 +1433,11 @@ class Qwen3VLModel(nnx.Module):
             for _ in range(text_config.num_hidden_layers)
         ]
 
-        self.norm = Qwen3VLTextRMSNorm(
+        self.norm = nnx.RMSNorm(
             hidden_size,
-            eps=rms_norm_eps,
-            dtype=dtype,
+            epsilon=rms_norm_eps,
+            param_dtype=dtype,
+            rngs=rng,
         )
 
         if hf_config.tie_word_embeddings:
@@ -1516,27 +1458,62 @@ class Qwen3VLModel(nnx.Module):
     ) -> jax.Array:
         """Add DeepStack visual features at masked positions.
 
+        DeepStack is a multi-layer visual feature injection technique that injects
+        visual embeddings into the language model at multiple decoder layers, not
+        just at the input embedding layer. This enables richer cross-modal fusion
+        by allowing visual information to influence intermediate representations.
+
+        This method is called after each early decoder layer (controlled by the
+        number of DeepStack layers configured in the vision encoder). The visual
+        features from each DeepStack layer are added to the hidden states at
+        positions corresponding to visual tokens.
+
+        Implementation Notes:
+            This optimized version uses direct indexing with jnp.nonzero + scatter-add
+            instead of the previous cumsum + gather approach. The scatter-based method
+            is more efficient because:
+            1. It avoids creating padded arrays with dummy rows
+            2. It uses fewer intermediate tensors
+            3. The .at[].add() operation is optimized for sparse updates
+
         Args:
-            hidden_states: (seq_len, hidden_size) or (batch, seq_len, hidden_size)
-            visual_pos_mask: Boolean mask matching hidden_states without the last dim
-            visual_embeds: Visual features (num_visual_tokens, hidden_size)
+            hidden_states: Language model hidden states with shape
+                (seq_len, hidden_size) for unbatched or
+                (batch, seq_len, hidden_size) for batched input.
+            visual_pos_mask: Boolean mask indicating positions where visual tokens
+                are located. Shape matches hidden_states without the last dimension.
+            visual_embeds: Visual features to inject from the current DeepStack layer.
+                Shape: (num_visual_tokens, hidden_size). The number of visual tokens
+                must match the number of True values in visual_pos_mask.
 
         Returns:
-            Updated hidden_states with visual features added
+            Updated hidden_states with visual features added at masked positions.
+            Same shape as input hidden_states.
         """
         flat_hidden = hidden_states.reshape(-1, hidden_states.shape[-1])
-        mask = jnp.broadcast_to(visual_pos_mask, hidden_states.shape[:-1])
-        flat_mask = mask.reshape(-1).astype(jnp.bool_)
+        flat_mask = visual_pos_mask.reshape(-1).astype(jnp.bool_)
 
+        # Get indices where visual tokens should be injected
+        # Use size parameter to make it JIT-compatible
+        num_visual = visual_embeds.shape[0]
+
+        # Use -1 as fill_value to identify padding indices
+        indices = jnp.nonzero(flat_mask, size=num_visual, fill_value=-1)[0]
+
+        # Ensure visual_embeds has matching dtype
         visual_embeds = visual_embeds.astype(flat_hidden.dtype)
-        dummy_row = jnp.zeros((1, flat_hidden.shape[-1]), dtype=flat_hidden.dtype)
-        padded_embeds = jnp.concatenate([dummy_row, visual_embeds, dummy_row], axis=0)
-        gather_indices = jnp.cumsum(flat_mask, dtype=jnp.int32)
-        max_index = visual_embeds.shape[0] + 1
-        gather_indices = jnp.minimum(gather_indices, max_index)
 
-        updates = padded_embeds[gather_indices] * flat_mask[:, None]
-        updated = flat_hidden + updates
+        # Create mask for valid indices (not -1 padding)
+        valid_mask = (indices >= 0).astype(flat_hidden.dtype)[:, None]
+
+        # Zero out embeddings for invalid/padded indices
+        masked_embeds = visual_embeds * valid_mask
+
+        # Clamp indices to valid range for scatter (padding indices become 0)
+        safe_indices = jnp.maximum(indices, 0)
+
+        # Use scatter-add for efficient update
+        updated = flat_hidden.at[safe_indices].add(masked_embeds)
 
         return updated.reshape(hidden_states.shape)
 
@@ -1935,11 +1912,32 @@ class Qwen3VLForConditionalGeneration(nnx.Module):
             vc.in_channels * vc.temporal_patch_size * vc.patch_size * vc.patch_size
         )
 
-        image_shapes = []
+        # Default warmup shapes for common image resolutions
+        default_warmup_shapes = [
+            (336, 336),    # Base resolution
+            (448, 448),    # 1.33x
+            (672, 672),    # 2x
+            (896, 896),    # 2.67x (Qwen3-VL default max)
+            (504, 336),    # 3:2 aspect ratio
+            (336, 504),    # 2:3 aspect ratio
+        ]
+
+        # Get user-provided shapes from config
+        user_shapes = []
         if warmup_config := self.vllm_config.additional_config.get(
             "vision_warmup_config"
         ):
-            image_shapes = warmup_config.get("image_shapes", [])
+            user_shapes = warmup_config.get("image_shapes", [])
+
+        # Merge default shapes with user-provided shapes, avoiding duplicates
+        seen_shapes = set()
+        image_shapes = []
+        for shape in default_warmup_shapes + user_shapes:
+            if isinstance(shape, (list, tuple)) and len(shape) == 2:
+                shape_tuple = tuple(shape)
+                if shape_tuple not in seen_shapes:
+                    seen_shapes.add(shape_tuple)
+                    image_shapes.append(list(shape))
 
         factor = vc.patch_size * vc.spatial_merge_size
         for input_hw in image_shapes:
@@ -1972,18 +1970,18 @@ class Qwen3VLForConditionalGeneration(nnx.Module):
 
         mappings = {
             "model.language_model.embed_tokens": "language_model.embed.embedding",
-            "model.language_model.layers.*.input_layernorm": "language_model.layers.*.input_layernorm.weight",
+            "model.language_model.layers.*.input_layernorm": "language_model.layers.*.input_layernorm.scale",
             "model.language_model.layers.*.mlp.down_proj": "language_model.layers.*.mlp.down_proj.kernel",
             "model.language_model.layers.*.mlp.gate_proj": "language_model.layers.*.mlp.gate_proj.kernel",
             "model.language_model.layers.*.mlp.up_proj": "language_model.layers.*.mlp.up_proj.kernel",
-            "model.language_model.layers.*.post_attention_layernorm": "language_model.layers.*.post_attention_layernorm.weight",
+            "model.language_model.layers.*.post_attention_layernorm": "language_model.layers.*.post_attention_layernorm.scale",
             "model.language_model.layers.*.self_attn.k_proj": "language_model.layers.*.self_attn.k_proj.kernel",
             "model.language_model.layers.*.self_attn.o_proj": "language_model.layers.*.self_attn.o_proj.kernel",
             "model.language_model.layers.*.self_attn.q_proj": "language_model.layers.*.self_attn.q_proj.kernel",
             "model.language_model.layers.*.self_attn.v_proj": "language_model.layers.*.self_attn.v_proj.kernel",
-            "model.language_model.layers.*.self_attn.q_norm": "language_model.layers.*.self_attn.q_norm.weight",
-            "model.language_model.layers.*.self_attn.k_norm": "language_model.layers.*.self_attn.k_norm.weight",
-            "model.language_model.norm": "language_model.norm.weight",
+            "model.language_model.layers.*.self_attn.q_norm": "language_model.layers.*.self_attn.q_norm.scale",
+            "model.language_model.layers.*.self_attn.k_norm": "language_model.layers.*.self_attn.k_norm.scale",
+            "model.language_model.norm": "language_model.norm.scale",
             "model.visual.patch_embed.proj": "visual.patch_embed.proj.kernel",
             "model.visual.patch_embed.proj.bias": "visual.patch_embed.proj.bias",
             "model.visual.pos_embed": "visual.pos_embed.embedding",

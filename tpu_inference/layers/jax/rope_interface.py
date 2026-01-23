@@ -28,6 +28,7 @@ def apply_rope(
     rope_theta: float = 10000,
     rope_scaling: Dict[str, Any] = None,
     rope_input_ordering: str = "split",
+    interleaved_mrope: bool = False,
 ) -> jax.Array:
     """
     Applies Rotary Positional Embedding using the sine and cosine strategy.
@@ -39,6 +40,10 @@ def apply_rope(
     If rope_input_ordering is "split", then the input pairs for rotation are taken one from the
     first and one from the second half of the head_dim. If it is "interleaved" then
     adjacent values are used as inputs for rotation.
+
+    When interleaved_mrope=True and positions is 3D (M-RoPE), the T/H/W frequencies
+    are interleaved rather than concatenated in groups. This is used by Qwen3-VL.
+    The pattern is: T at [0,3,6,...], H at [1,4,7,...], W at [2,5,8,...].
     """
 
     # M-RoPE support for multimodal models (e.g., Qwen-VL).
@@ -79,39 +84,70 @@ def apply_rope(
                 f"({half_dim}), but got {mrope_section} for head_dim={head_dim}."
             )
 
-        split_indices = [mrope_section[0], mrope_section[0] + mrope_section[1]]
+        half_dim = head_dim // 2
 
-        # Indices for the features to be rotated (first half of head_dim)
-        all_freq_indices = jnp.arange(head_dim // 2)
+        if interleaved_mrope:
+            # Interleaved M-RoPE: T at [0,3,6,...], H at [1,4,7,...], W at [2,5,8,...]
+            # This is used by Qwen3-VL.
+            t_sec, h_sec, w_sec = mrope_section
 
-        # Split the indices according to mrope_section. This is valid because split_indices are static.
-        freq_indices_split = jnp.split(all_freq_indices, split_indices)
-        # freq_indices_split is a list of 3 JAX arrays.
+            # Compute inv_freq for all half_dim positions
+            all_indices = jnp.arange(half_dim)
+            inv_freq = 1.0 / (rope_theta ** (all_indices * 2.0 / head_dim))
 
-        cos_list = []
-        sin_list = []
+            # Compute freqs for each position dimension: (seq_len, half_dim)
+            freqs_t = jnp.outer(positions[0], inv_freq)
+            freqs_h = jnp.outer(positions[1], inv_freq)
+            freqs_w = jnp.outer(positions[2], inv_freq)
 
-        for i in range(3):  # For each of the 3 position dimensions
-            current_indices = freq_indices_split[i]
+            # Start with T frequencies as base
+            freqs = freqs_t.copy()
 
-            if current_indices.size == 0:
-                # This section is empty, skip.
-                continue
+            # Interleave H at indices [1, 4, 7, ...] up to h_sec * 3
+            h_indices = jnp.arange(1, h_sec * 3, 3)
+            freqs = freqs.at[:, h_indices].set(freqs_h[:, h_indices])
 
-            # inv_freq shape: (mrope_section[i],)
-            inv_freq = 1.0 / (rope_theta**(current_indices * 2.0 / head_dim))
+            # Interleave W at indices [2, 5, 8, ...] up to w_sec * 3
+            w_indices = jnp.arange(2, w_sec * 3, 3)
+            freqs = freqs.at[:, w_indices].set(freqs_w[:, w_indices])
 
-            # positions[i]: (seq_len,)
-            # freqs shape: (seq_len, mrope_section[i])
-            freqs = jnp.outer(positions[i], inv_freq)
+            cos = jnp.cos(freqs)
+            sin = jnp.sin(freqs)
+        else:
+            # Grouped M-RoPE: sections are contiguous (used by Qwen2.5-VL)
+            split_indices = [mrope_section[0], mrope_section[0] + mrope_section[1]]
 
-            cos_list.append(jnp.cos(freqs))
-            sin_list.append(jnp.sin(freqs))
+            # Indices for the features to be rotated (first half of head_dim)
+            all_freq_indices = jnp.arange(half_dim)
 
-        # Concatenate along the feature dimension
-        # cos, sin shape: (seq_len, head_dim//2)
-        cos = jnp.concatenate(cos_list, axis=1)
-        sin = jnp.concatenate(sin_list, axis=1)
+            # Split the indices according to mrope_section. This is valid because split_indices are static.
+            freq_indices_split = jnp.split(all_freq_indices, split_indices)
+            # freq_indices_split is a list of 3 JAX arrays.
+
+            cos_list = []
+            sin_list = []
+
+            for i in range(3):  # For each of the 3 position dimensions
+                current_indices = freq_indices_split[i]
+
+                if current_indices.size == 0:
+                    # This section is empty, skip.
+                    continue
+
+                # inv_freq shape: (mrope_section[i],)
+                inv_freq = 1.0 / (rope_theta**(current_indices * 2.0 / head_dim))
+
+                # positions[i]: (seq_len,)
+                # freqs shape: (seq_len, mrope_section[i])
+                freqs = jnp.outer(positions[i], inv_freq)
+
+                cos_list.append(jnp.cos(freqs))
+                sin_list.append(jnp.sin(freqs))
+
+            # Concatenate along the feature dimension
+            # cos, sin shape: (seq_len, head_dim//2)
+            cos = jnp.concatenate(cos_list, axis=1)
+            sin = jnp.concatenate(sin_list, axis=1)
 
         # Add num_heads dimension for broadcasting
         cos = cos[:, jnp.newaxis, :]  # Shape: (seq_len, 1, head_dim//2)

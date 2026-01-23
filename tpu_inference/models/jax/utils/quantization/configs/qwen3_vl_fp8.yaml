@@ -1,0 +1,73 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Qwen3-VL FP8 Quantization Configuration
+#
+# This config enables FP8 quantization for Qwen3-VL models.
+# Vision encoder attention is kept at BF16 for numerical stability.
+#
+# Usage:
+#   --quantization fp8 --quantization-config qwen3_vl_fp8.yaml
+
+global_config:
+  dtype: float8_e4m3fn
+  weight_block_size: 128
+  use_abstract_model: true
+
+layer_configs:
+  # Vision Encoder - Keep attention at higher precision for stability
+  - pattern: "visual.blocks.*.attn.qkv_proj"
+    dtype: bfloat16
+  - pattern: "visual.blocks.*.attn.proj"
+    dtype: bfloat16
+
+  # Vision Encoder MLP - Can use FP8
+  - pattern: "visual.blocks.*.mlp.fc1"
+    dtype: float8_e4m3fn
+  - pattern: "visual.blocks.*.mlp.fc2"
+    dtype: float8_e4m3fn
+
+  # Vision Patch Embed and Mergers
+  - pattern: "visual.patch_embed.proj"
+    dtype: bfloat16
+  - pattern: "visual.merger.*"
+    dtype: float8_e4m3fn
+  - pattern: "visual.deepstack_merger_list.*"
+    dtype: float8_e4m3fn
+
+  # Text Decoder - Full FP8
+  - pattern: "language_model.layers.*.self_attn.q_proj"
+    dtype: float8_e4m3fn
+  - pattern: "language_model.layers.*.self_attn.k_proj"
+    dtype: float8_e4m3fn
+  - pattern: "language_model.layers.*.self_attn.v_proj"
+    dtype: float8_e4m3fn
+  - pattern: "language_model.layers.*.self_attn.o_proj"
+    dtype: float8_e4m3fn
+  - pattern: "language_model.layers.*.mlp.gate_proj"
+    dtype: float8_e4m3fn
+  - pattern: "language_model.layers.*.mlp.up_proj"
+    dtype: float8_e4m3fn
+  - pattern: "language_model.layers.*.mlp.down_proj"
+    dtype: float8_e4m3fn
+
+  # Embeddings and norms stay at higher precision
+  - pattern: "language_model.embed"
+    dtype: bfloat16
+  - pattern: "language_model.norm"
+    dtype: bfloat16
+  - pattern: "language_model.layers.*.input_layernorm"
+    dtype: bfloat16
+  - pattern: "language_model.layers.*.post_attention_layernorm"
+    dtype: bfloat16

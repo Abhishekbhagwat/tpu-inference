@@ -30,7 +30,6 @@ from tpu_inference.models.jax.qwen3_vl import (
     generate_segment_ids_from_grid_thw,
     get_mrope_input_positions,
     pad_segment_ids_for_attention,
-    rotate_half,
 )
 from tpu_inference.runner.kv_cache import create_kv_caches
 
@@ -445,36 +444,6 @@ class TestComputeVisionCountsPerSequence:
         )
         assert int(num_images[0]) == 0
         assert int(num_videos[0]) == 0
-
-
-class TestRotateHalf:
-    """Tests for rotate_half RoPE helper function."""
-
-    def test_basic_rotation(self):
-        x = jnp.array([1.0, 2.0, 3.0, 4.0])
-        result = rotate_half(x)
-        # First half becomes negated second half, second half becomes first half
-        # [-3, -4, 1, 2]
-        np.testing.assert_allclose(np.array(result), [-3.0, -4.0, 1.0, 2.0])
-
-    def test_2d_input(self):
-        x = jnp.array([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]])
-        result = rotate_half(x)
-        expected = jnp.array([[-3.0, -4.0, 1.0, 2.0], [-7.0, -8.0, 5.0, 6.0]])
-        np.testing.assert_allclose(np.array(result), np.array(expected))
-
-    def test_3d_input(self):
-        x = jnp.ones((2, 3, 4))
-        result = rotate_half(x)
-        assert result.shape == x.shape
-        # First half of last dim should be -1, second half should be 1
-        np.testing.assert_allclose(np.array(result[..., :2]), -1.0 * np.ones((2, 3, 2)))
-        np.testing.assert_allclose(np.array(result[..., 2:]), 1.0 * np.ones((2, 3, 2)))
-
-    def test_preserves_dtype(self):
-        x = jnp.ones((4,), dtype=jnp.bfloat16)
-        result = rotate_half(x)
-        assert result.dtype == jnp.bfloat16
 
 
 class TestMRoPEPositions:
@@ -1047,3 +1016,543 @@ class TestServingIntegration:
         diff = np.abs(np.array(out_deep - out_base))
         placeholder_mask = np.array(input_ids) == model.image_token_id
         assert diff[placeholder_mask].max() > 0
+
+
+class TestInterleavedMRoPEPattern:
+    """Tests for the interleaved MRoPE pattern correctness."""
+
+    def test_interleaved_pattern_basic(self):
+        """Test that interleaved MRoPE places frequencies correctly."""
+        # Create mock frequencies for T, H, W with shape (3, bs, seq, head_dim//2)
+        # Use mrope_section = [2, 2, 2] for simplicity (head_dim//2 = 6)
+        freqs = jnp.zeros((3, 1, 1, 6), dtype=jnp.float32)
+        freqs = freqs.at[0].set(1.0)  # T frequencies = 1
+        freqs = freqs.at[1].set(2.0)  # H frequencies = 2
+        freqs = freqs.at[2].set(3.0)  # W frequencies = 3
+
+        result = apply_interleaved_mrope(freqs, [2, 2, 2])
+
+        # Check shape
+        assert result.shape == (1, 1, 6)
+
+        # Check interleaving pattern:
+        # T is placed at indices: 0, 3 (starting from 0, step 3, up to 2*3=6)
+        # H is placed at indices: 1, 4 (starting from 1, step 3, up to 2*3=6)
+        # W is placed at indices: 2, 5 (starting from 2, step 3, up to 2*3=6)
+        result_flat = result[0, 0]
+        # Index 0: T=1.0 (from freqs[0])
+        assert float(result_flat[0]) == 1.0
+        # Index 1: H=2.0 (from freqs[1])
+        assert float(result_flat[1]) == 2.0
+        # Index 2: W=3.0 (from freqs[2])
+        assert float(result_flat[2]) == 3.0
+        # Index 3: T=1.0 (from freqs[0])
+        assert float(result_flat[3]) == 1.0
+        # Index 4: H=2.0 (from freqs[1])
+        assert float(result_flat[4]) == 2.0
+        # Index 5: W=3.0 (from freqs[2])
+        assert float(result_flat[5]) == 3.0
+
+    def test_interleaved_pattern_with_distinct_values(self):
+        """Test interleaving with distinct values per position."""
+        # Create freqs where each position has a unique value
+        freqs = jnp.zeros((3, 1, 1, 6), dtype=jnp.float32)
+        # T: [10, 11, 12, 13, 14, 15]
+        freqs = freqs.at[0, 0, 0, :].set(jnp.arange(10, 16, dtype=jnp.float32))
+        # H: [20, 21, 22, 23, 24, 25]
+        freqs = freqs.at[1, 0, 0, :].set(jnp.arange(20, 26, dtype=jnp.float32))
+        # W: [30, 31, 32, 33, 34, 35]
+        freqs = freqs.at[2, 0, 0, :].set(jnp.arange(30, 36, dtype=jnp.float32))
+
+        result = apply_interleaved_mrope(freqs, [2, 2, 2])
+        result_flat = result[0, 0]
+
+        # H indices are [1, 4], picking from H at those positions
+        np.testing.assert_allclose(float(result_flat[1]), 21.0)
+        np.testing.assert_allclose(float(result_flat[4]), 24.0)
+
+        # W indices are [2, 5], picking from W at those positions
+        np.testing.assert_allclose(float(result_flat[2]), 32.0)
+        np.testing.assert_allclose(float(result_flat[5]), 35.0)
+
+        # T indices are everything else (0, 3), picking from T
+        np.testing.assert_allclose(float(result_flat[0]), 10.0)
+        np.testing.assert_allclose(float(result_flat[3]), 13.0)
+
+    def test_interleaved_with_typical_qwen3vl_section(self):
+        """Test with typical Qwen3VL mrope_section [24, 20, 20]."""
+        freqs = jnp.zeros((3, 2, 8, 64), dtype=jnp.float32)
+        freqs = freqs.at[0].set(1.0)
+        freqs = freqs.at[1].set(2.0)
+        freqs = freqs.at[2].set(3.0)
+
+        result = apply_interleaved_mrope(freqs, [24, 20, 20])
+
+        # Check shape preservation
+        assert result.shape == (2, 8, 64)
+
+        # Check H indices (1, 4, 7, ..., 58)
+        h_indices = np.arange(1, 20 * 3, 3)
+        for idx in h_indices:
+            np.testing.assert_allclose(np.array(result[:, :, idx]), 2.0)
+
+        # Check W indices (2, 5, 8, ..., 59)
+        w_indices = np.arange(2, 20 * 3, 3)
+        for idx in w_indices:
+            np.testing.assert_allclose(np.array(result[:, :, idx]), 3.0)
+
+    def test_interleaved_preserves_batch_and_seq_dims(self):
+        """Test that batch and sequence dimensions are preserved."""
+        batch_size, seq_len = 4, 16
+        freqs = jnp.ones((3, batch_size, seq_len, 12), dtype=jnp.float32)
+        result = apply_interleaved_mrope(freqs, [4, 4, 4])
+        assert result.shape == (batch_size, seq_len, 12)
+
+
+class TestDeepStackInjection:
+    """Tests for DeepStack visual feature injection."""
+
+    def test_inject_visual_features_shape(self, mock_vllm_config: MockVllmConfig, rng: PRNGKey, mesh: Mesh):
+        """Test that DeepStack injection preserves shapes."""
+        model = Qwen3VLForConditionalGeneration(mock_vllm_config, rng, mesh)
+
+        seq_len = 100
+        hidden_size = model.config.hidden_size
+        num_visual = 20
+
+        hidden_states = jnp.ones((seq_len, hidden_size), dtype=jnp.float32)
+        visual_mask = jnp.zeros(seq_len, dtype=jnp.bool_)
+        visual_mask = visual_mask.at[10:30].set(True)  # 20 visual positions
+        visual_embeds = jnp.ones((num_visual, hidden_size), dtype=jnp.float32) * 2.0
+
+        # Test the standalone function through language_model
+        result = model.language_model._inject_visual_features(
+            hidden_states, visual_mask, visual_embeds
+        )
+
+        # Shape should be preserved
+        assert result.shape == hidden_states.shape
+
+    def test_inject_visual_features_values_added(self, mock_vllm_config: MockVllmConfig, rng: PRNGKey, mesh: Mesh):
+        """Test that visual features are added (not replaced)."""
+        model = Qwen3VLForConditionalGeneration(mock_vllm_config, rng, mesh)
+
+        seq_len = 10
+        hidden_size = model.config.hidden_size
+        num_visual = 3
+
+        # Create hidden states with value 1.0
+        hidden_states = jnp.ones((seq_len, hidden_size), dtype=jnp.float32)
+
+        # Visual mask at positions 2, 3, 4
+        visual_mask = jnp.zeros(seq_len, dtype=jnp.bool_)
+        visual_mask = visual_mask.at[2:5].set(True)
+
+        # Visual embeddings with value 5.0
+        visual_embeds = jnp.ones((num_visual, hidden_size), dtype=jnp.float32) * 5.0
+
+        result = model.language_model._inject_visual_features(
+            hidden_states, visual_mask, visual_embeds
+        )
+
+        # Non-visual positions should remain unchanged (value 1.0)
+        non_visual_positions = [0, 1, 5, 6, 7, 8, 9]
+        for pos in non_visual_positions:
+            np.testing.assert_allclose(np.array(result[pos]), np.ones(hidden_size))
+
+        # Visual positions should have original + visual (1.0 + 5.0 = 6.0)
+        visual_positions = [2, 3, 4]
+        for pos in visual_positions:
+            np.testing.assert_allclose(np.array(result[pos]), np.ones(hidden_size) * 6.0)
+
+    def test_inject_visual_features_batched(self, mock_vllm_config: MockVllmConfig, rng: PRNGKey, mesh: Mesh):
+        """Test injection with batched hidden states."""
+        model = Qwen3VLForConditionalGeneration(mock_vllm_config, rng, mesh)
+
+        batch_size, seq_len = 2, 10
+        hidden_size = model.config.hidden_size
+        num_visual = 4
+
+        hidden_states = jnp.ones((batch_size, seq_len, hidden_size), dtype=jnp.float32)
+        visual_mask = jnp.zeros(seq_len, dtype=jnp.bool_)
+        visual_mask = visual_mask.at[0:2].set(True)  # First 2 positions per batch
+        visual_embeds = jnp.ones((num_visual, hidden_size), dtype=jnp.float32) * 3.0
+
+        result = model.language_model._inject_visual_features(
+            hidden_states, visual_mask, visual_embeds
+        )
+
+        # Shape should be preserved
+        assert result.shape == hidden_states.shape
+
+    def test_inject_visual_features_empty_mask(self, mock_vllm_config: MockVllmConfig, rng: PRNGKey, mesh: Mesh):
+        """Test injection with no visual positions (empty mask)."""
+        model = Qwen3VLForConditionalGeneration(mock_vllm_config, rng, mesh)
+
+        seq_len = 10
+        hidden_size = model.config.hidden_size
+
+        hidden_states = jnp.ones((seq_len, hidden_size), dtype=jnp.float32)
+        visual_mask = jnp.zeros(seq_len, dtype=jnp.bool_)  # No visual positions
+
+        # Use a dummy embedding since the function expects at least some input
+        # When mask is all False, no additions should happen
+        visual_embeds_dummy = jnp.ones((1, hidden_size), dtype=jnp.float32) * 100.0
+        result = model.language_model._inject_visual_features(
+            hidden_states, visual_mask, visual_embeds_dummy
+        )
+
+        # All positions should remain unchanged
+        np.testing.assert_allclose(np.array(result), np.ones((seq_len, hidden_size)))
+
+
+class TestBilinearInterpolation:
+    """Tests for bilinear interpolation of positional embeddings."""
+
+    def test_interpolation_identity_square(self, mock_vllm_config: MockVllmConfig, rng: PRNGKey, mesh: Mesh):
+        """Test that interpolation at base resolution returns original for square grid."""
+        cfg = copy.deepcopy(mock_vllm_config.model_config.hf_config)
+        cfg.vision_config = MockVisionConfig(
+            hidden_size=32,
+            intermediate_size=64,
+            patch_size=2,
+            image_size=8,  # 4x4 patch grid
+            temporal_patch_size=1,
+            in_channels=3,
+            spatial_merge_size=2,
+            out_hidden_size=64,
+            depth=0,
+            num_heads=4,
+            num_position_embeddings=16,  # 4x4 grid
+            deepstack_visual_indexes=(),
+        )
+        model_config = MockModelConfig(hf_config=cfg, dtype=mock_vllm_config.model_config.dtype)
+        vllm_cfg = MockVllmConfig()
+        vllm_cfg.model_config = model_config
+
+        vision = Qwen3VLVisionTransformer(vllm_cfg, nnx.Rngs(params=rng), mesh)
+
+        # Grid (1, 4, 4) produces 1*4*4 = 16 patches BEFORE spatial merge
+        # fast_pos_embed_interpolate returns embeddings at patch level
+        # Spatial merge happens later in the full forward pass
+        pos_embeds = vision.fast_pos_embed_interpolate(((1, 4, 4),))
+        assert pos_embeds.shape == (16, cfg.vision_config.hidden_size)
+
+    def test_interpolation_upscale(self, mock_vllm_config: MockVllmConfig, rng: PRNGKey, mesh: Mesh):
+        """Test upscaling interpolation produces smooth results."""
+        cfg = copy.deepcopy(mock_vllm_config.model_config.hf_config)
+        cfg.vision_config = MockVisionConfig(
+            hidden_size=32,
+            intermediate_size=64,
+            patch_size=2,
+            image_size=4,  # 2x2 patch grid
+            temporal_patch_size=1,
+            in_channels=3,
+            spatial_merge_size=1,  # No merging for simpler test
+            out_hidden_size=64,
+            depth=0,
+            num_heads=4,
+            num_position_embeddings=4,  # 2x2 base grid
+            deepstack_visual_indexes=(),
+        )
+        model_config = MockModelConfig(hf_config=cfg, dtype=mock_vllm_config.model_config.dtype)
+        vllm_cfg = MockVllmConfig()
+        vllm_cfg.model_config = model_config
+
+        vision = Qwen3VLVisionTransformer(vllm_cfg, nnx.Rngs(params=rng), mesh)
+
+        # Upscale to 4x4 grid (larger than 2x2 base)
+        pos_embeds = vision.fast_pos_embed_interpolate(((1, 4, 4),))
+        assert pos_embeds.shape == (16, cfg.vision_config.hidden_size)
+
+        # Interpolated values should not be all identical
+        # (unless the base embeddings happen to be identical, which is unlikely)
+        assert not jnp.allclose(pos_embeds[0], pos_embeds[-1])
+
+    def test_interpolation_downscale(self, mock_vllm_config: MockVllmConfig, rng: PRNGKey, mesh: Mesh):
+        """Test downscaling interpolation."""
+        cfg = copy.deepcopy(mock_vllm_config.model_config.hf_config)
+        cfg.vision_config = MockVisionConfig(
+            hidden_size=32,
+            intermediate_size=64,
+            patch_size=2,
+            image_size=8,  # 4x4 patch grid
+            temporal_patch_size=1,
+            in_channels=3,
+            spatial_merge_size=1,
+            out_hidden_size=64,
+            depth=0,
+            num_heads=4,
+            num_position_embeddings=16,  # 4x4 base grid
+            deepstack_visual_indexes=(),
+        )
+        model_config = MockModelConfig(hf_config=cfg, dtype=mock_vllm_config.model_config.dtype)
+        vllm_cfg = MockVllmConfig()
+        vllm_cfg.model_config = model_config
+
+        vision = Qwen3VLVisionTransformer(vllm_cfg, nnx.Rngs(params=rng), mesh)
+
+        # Downscale to 2x2 grid (smaller than 4x4 base)
+        pos_embeds = vision.fast_pos_embed_interpolate(((1, 2, 2),))
+        assert pos_embeds.shape == (4, cfg.vision_config.hidden_size)
+
+    def test_interpolation_rectangular_grid(self, mock_vllm_config: MockVllmConfig, rng: PRNGKey, mesh: Mesh):
+        """Test interpolation with rectangular target grid."""
+        cfg = copy.deepcopy(mock_vllm_config.model_config.hf_config)
+        cfg.vision_config = MockVisionConfig(
+            hidden_size=32,
+            intermediate_size=64,
+            patch_size=2,
+            image_size=8,
+            temporal_patch_size=1,
+            in_channels=3,
+            spatial_merge_size=1,
+            out_hidden_size=64,
+            depth=0,
+            num_heads=4,
+            num_position_embeddings=16,  # 4x4 base grid
+            deepstack_visual_indexes=(),
+        )
+        model_config = MockModelConfig(hf_config=cfg, dtype=mock_vllm_config.model_config.dtype)
+        vllm_cfg = MockVllmConfig()
+        vllm_cfg.model_config = model_config
+
+        vision = Qwen3VLVisionTransformer(vllm_cfg, nnx.Rngs(params=rng), mesh)
+
+        # Target rectangular grid 2x6
+        pos_embeds = vision.fast_pos_embed_interpolate(((1, 2, 6),))
+        assert pos_embeds.shape == (12, cfg.vision_config.hidden_size)
+
+    def test_interpolation_multiple_images(self, mock_vllm_config: MockVllmConfig, rng: PRNGKey, mesh: Mesh):
+        """Test interpolation with multiple images/grids."""
+        cfg = copy.deepcopy(mock_vllm_config.model_config.hf_config)
+        cfg.vision_config = MockVisionConfig(
+            hidden_size=32,
+            intermediate_size=64,
+            patch_size=2,
+            image_size=8,
+            temporal_patch_size=1,
+            in_channels=3,
+            spatial_merge_size=1,
+            out_hidden_size=64,
+            depth=0,
+            num_heads=4,
+            num_position_embeddings=16,
+            deepstack_visual_indexes=(),
+        )
+        model_config = MockModelConfig(hf_config=cfg, dtype=mock_vllm_config.model_config.dtype)
+        vllm_cfg = MockVllmConfig()
+        vllm_cfg.model_config = model_config
+
+        vision = Qwen3VLVisionTransformer(vllm_cfg, nnx.Rngs(params=rng), mesh)
+
+        # Two images with different grids
+        pos_embeds = vision.fast_pos_embed_interpolate(((1, 2, 2), (1, 4, 4)))
+        # First image: 2*2 = 4 tokens, second image: 4*4 = 16 tokens
+        assert pos_embeds.shape == (4 + 16, cfg.vision_config.hidden_size)
+
+
+class TestCosmosReason2Compatibility:
+    """Tests for NVIDIA Cosmos-Reason2 compatibility with Qwen3VL."""
+
+    def test_cosmos_config_loading(self, mock_vllm_config: MockVllmConfig, rng: PRNGKey, mesh: Mesh):
+        """Test that Cosmos-Reason2-like config can be loaded with Qwen3VL model.
+
+        Cosmos-Reason2 uses the same architecture as Qwen3VL, just with different
+        config values (different hidden sizes, layer depths, etc.).
+        """
+        # Create a config similar to what Cosmos-Reason2 might use
+        cfg = copy.deepcopy(mock_vllm_config.model_config.hf_config)
+
+        # Cosmos-specific adjustments (example values)
+        cfg.hidden_size = 128  # Larger hidden size
+        cfg.num_hidden_layers = 4  # More layers
+        cfg.num_attention_heads = 8
+        cfg.num_key_value_heads = 8
+        cfg.head_dim = cfg.hidden_size // cfg.num_attention_heads
+        cfg.rope_scaling = {"mrope_section": [8, 4, 4]}  # Different MRoPE section
+
+        cfg.vision_config = MockVisionConfig(
+            hidden_size=64,
+            intermediate_size=128,
+            patch_size=2,
+            image_size=16,
+            temporal_patch_size=2,  # Different temporal patch size
+            in_channels=3,
+            spatial_merge_size=2,
+            out_hidden_size=128,  # Matches language model hidden size
+            depth=2,
+            num_heads=4,
+            num_position_embeddings=64,
+            deepstack_visual_indexes=(0, 1),  # DeepStack at specific layers
+            tokens_per_second=2.0,  # Different video token rate
+        )
+
+        model_config = MockModelConfig(hf_config=cfg, dtype=jnp.bfloat16)
+        cosmos_vllm_config = MockVllmConfig()
+        cosmos_vllm_config.model_config = model_config
+
+        # Model should instantiate without errors
+        model = Qwen3VLForConditionalGeneration(cosmos_vllm_config, rng, mesh)
+
+        # Verify config is properly loaded
+        assert model.config.hidden_size == 128
+        assert model.config.num_hidden_layers == 4
+        assert model.config.vision_config.temporal_patch_size == 2
+        assert model.config.vision_config.tokens_per_second == 2.0
+
+    def test_cosmos_mrope_section_compatibility(self, mock_vllm_config: MockVllmConfig, rng: PRNGKey, mesh: Mesh):
+        """Test that different MRoPE sections work correctly."""
+        cfg = copy.deepcopy(mock_vllm_config.model_config.hf_config)
+        # Different MRoPE section configuration
+        cfg.rope_scaling = {"mrope_section": [8, 4, 4]}
+        cfg.hidden_size = 32
+        cfg.num_attention_heads = 2
+        cfg.num_key_value_heads = 2
+        cfg.head_dim = cfg.hidden_size // cfg.num_attention_heads
+
+        model_config = MockModelConfig(hf_config=cfg, dtype=jnp.bfloat16)
+        cosmos_vllm_config = MockVllmConfig()
+        cosmos_vllm_config.model_config = model_config
+
+        model = Qwen3VLForConditionalGeneration(cosmos_vllm_config, rng, mesh)
+
+        # Generate positions and verify MRoPE works
+        tokens = [1, 2, 3, 4]
+        positions, _ = model.get_mrope_input_positions(
+            input_tokens=tokens,
+            hf_config=model.config,
+            image_grid_thw=None,
+            video_grid_thw=None,
+            context_len=0,
+            seq_len=len(tokens),
+        )
+        assert positions.shape == (3, len(tokens))
+
+    def test_cosmos_deepstack_indexes(self, mock_vllm_config: MockVllmConfig, rng: PRNGKey, mesh: Mesh):
+        """Test that custom DeepStack visual indexes work."""
+        cfg = copy.deepcopy(mock_vllm_config.model_config.hf_config)
+        cfg.vision_config = MockVisionConfig(
+            hidden_size=32,
+            intermediate_size=64,
+            patch_size=2,
+            image_size=8,
+            temporal_patch_size=1,
+            in_channels=3,
+            spatial_merge_size=2,
+            out_hidden_size=64,
+            depth=2,
+            num_heads=4,
+            num_position_embeddings=16,
+            deepstack_visual_indexes=(0, 1),  # Custom indexes
+        )
+
+        model_config = MockModelConfig(hf_config=cfg, dtype=jnp.bfloat16)
+        cosmos_vllm_config = MockVllmConfig()
+        cosmos_vllm_config.model_config = model_config
+
+        model = Qwen3VLForConditionalGeneration(cosmos_vllm_config, rng, mesh)
+
+        # Verify DeepStack merger list has correct length
+        assert len(model.visual.deepstack_merger_list) == 2
+        assert model.visual.deepstack_visual_indexes == (0, 1)
+
+
+class TestQwen3VLIntegration:
+    """Integration tests for Qwen3VL end-to-end inference.
+
+    These tests require model weights and are skipped by default.
+    """
+
+    @pytest.mark.skip(reason="Requires model weights")
+    def test_single_image_inference(self, mock_vllm_config: MockVllmConfig, rng: PRNGKey, mesh: Mesh):
+        """Test single image captioning end-to-end.
+
+        This test would:
+        1. Load actual model weights
+        2. Process a single image through the vision encoder
+        3. Generate a caption using the language model
+        """
+        # Placeholder for actual implementation
+        model = Qwen3VLForConditionalGeneration(mock_vllm_config, rng, mesh)
+
+        # Load weights (would be implemented when weights are available)
+        # model.load_weights(rng)
+
+        # Process image
+        grid = (1, 4, 4)
+        vc = model.config.vision_config
+        patch_dim = int(vc.in_channels * vc.temporal_patch_size * vc.patch_size * vc.patch_size)
+        num_patches = grid[0] * grid[1] * grid[2]
+        pixel_values = jax.random.normal(rng, (num_patches, patch_dim)).astype(jnp.bfloat16)
+
+        mm_result = model.embed_multimodal((grid,), pixel_values=pixel_values)
+        assert "embeds" in mm_result
+        assert len(mm_result["embeds"]) == 1
+
+    @pytest.mark.skip(reason="Requires model weights")
+    def test_multi_image_inference(self, mock_vllm_config: MockVllmConfig, rng: PRNGKey, mesh: Mesh):
+        """Test multi-image understanding end-to-end.
+
+        This test would:
+        1. Load actual model weights
+        2. Process multiple images through the vision encoder
+        3. Generate a response comparing or reasoning about multiple images
+        """
+        model = Qwen3VLForConditionalGeneration(mock_vllm_config, rng, mesh)
+
+        # Process multiple images
+        grids = ((1, 4, 4), (1, 4, 4), (1, 2, 2))
+        vc = model.config.vision_config
+        patch_dim = int(vc.in_channels * vc.temporal_patch_size * vc.patch_size * vc.patch_size)
+
+        total_patches = sum(g[0] * g[1] * g[2] for g in grids)
+        pixel_values = jax.random.normal(rng, (total_patches, patch_dim)).astype(jnp.bfloat16)
+
+        mm_result = model.embed_multimodal(grids, pixel_values=pixel_values)
+        assert "embeds" in mm_result
+        assert len(mm_result["embeds"]) == 3
+
+    @pytest.mark.skip(reason="Requires model weights")
+    def test_video_inference(self, mock_vllm_config: MockVllmConfig, rng: PRNGKey, mesh: Mesh):
+        """Test video understanding end-to-end.
+
+        This test would:
+        1. Load actual model weights
+        2. Process video frames through the vision encoder
+        3. Generate a response describing the video content
+        """
+        model = Qwen3VLForConditionalGeneration(mock_vllm_config, rng, mesh)
+
+        # Process video (multiple temporal frames)
+        video_grid = (4, 4, 4)  # 4 frames
+        vc = model.config.vision_config
+        patch_dim = int(vc.in_channels * vc.temporal_patch_size * vc.patch_size * vc.patch_size)
+        num_patches = video_grid[0] * video_grid[1] * video_grid[2]
+        pixel_values = jax.random.normal(rng, (num_patches, patch_dim)).astype(jnp.bfloat16)
+
+        mm_result = model.embed_multimodal((video_grid,), pixel_values=pixel_values)
+        assert "embeds" in mm_result
+
+    @pytest.mark.skip(reason="Requires model weights and GPU resources")
+    def test_mixed_image_video_inference(self, mock_vllm_config: MockVllmConfig, rng: PRNGKey, mesh: Mesh):
+        """Test mixed image and video understanding.
+
+        This test would process both images and videos in a single context.
+        """
+        model = Qwen3VLForConditionalGeneration(mock_vllm_config, rng, mesh)
+
+        # Mix of image (t=1) and video (t>1) grids
+        image_grid = (1, 4, 4)
+        video_grid = (4, 4, 4)
+        grids = (image_grid, video_grid)
+
+        vc = model.config.vision_config
+        patch_dim = int(vc.in_channels * vc.temporal_patch_size * vc.patch_size * vc.patch_size)
+
+        total_patches = sum(g[0] * g[1] * g[2] for g in grids)
+        pixel_values = jax.random.normal(rng, (total_patches, patch_dim)).astype(jnp.bfloat16)
+
+        mm_result = model.embed_multimodal(grids, pixel_values=pixel_values)
+        assert "embeds" in mm_result
+        assert len(mm_result["embeds"]) == 2
