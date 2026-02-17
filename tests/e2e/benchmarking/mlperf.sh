@@ -1,4 +1,18 @@
 #!/bin/bash
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 
 # This script, by default, will test running Llama3.1-8B-Instruct on 10 prompts on the MLPerf dataset to check that the ROUGE score and overall throughput are reasonable.
 # Specifically, it will do the following:
@@ -16,9 +30,9 @@
 LOG_FILE="server.log"
 BENCHMARK_LOG_FILE="benchmark.log"
 # The sentinel message that indicates the server is ready (in LOG_FILE)
-READY_MESSAGE="Application startup complete."
+export READY_MESSAGE="Application startup complete."
 # After how long we should timeout if the server doesn't start
-TIMEOUT_SECONDS=1800
+export TIMEOUT_SECONDS=1800
 
 # The minimum ROUGE1 and throughput scores we expect
 # TODO (jacobplatin): these are very low, so we'll want to boost them eventually
@@ -59,6 +73,10 @@ helpFunction()
    echo -e "\t--use-dummy-weights Use dummy random weight (default: false)"
    exit 1
 }
+
+# Access shared benchmarking functionality
+# shellcheck disable=SC1091
+source "$(dirname "$0")/bench_utils.sh"
 
 while [[ "$#" -gt 0 ]]; do
     case "$1" in
@@ -130,6 +148,19 @@ if [ "$use_dummy_weights" = true ]; then
     extra_serve_args+=("--load-format=dummy")
 fi
 
+if [ "$USE_V6E8_QUEUE" == "True" ]; then
+    # Set to 8 if job is in 8 chips queue.
+    # TODO (Qiliang Cui) Rename USE_V6E8_QUEUE to USE_8_CHIPS_QUEUE
+    extra_serve_args+=(--tensor-parallel-size 8)
+elif [ "$IS_FOR_V7X" == "true" ]; then
+    # Set the default value to 2 for tpu v7x
+    # TODO (Qiliang Cui) Investigate why tensor-parallel-size=1 breaks in tpu7x
+    extra_serve_args+=(--tensor-parallel-size 2)
+else
+    extra_serve_args+=(--tensor-parallel-size 1)
+fi
+
+
 echo extra_serve_args: "${extra_serve_args[@]}"
 
 
@@ -142,18 +173,6 @@ echo "Using vLLM hash: $(git rev-parse HEAD)"
 # Overwrite a few of the vLLM benchmarking scripts with the TPU Inference ones
 cp -r "$root_dir"/tpu_inference/scripts/vllm/benchmarking/*.py "$root_dir"/vllm/benchmarks/
 echo "Using TPU Inference hash: $(git -C "$root_dir"/tpu_inference rev-parse HEAD)"
-
-cleanUp() {
-    echo "Stopping the vLLM server and cleaning up log files..."
-    pkill -f "vllm serve $1"
-    # Kill all processes related to vllm.
-    pgrep -f -i vllm | xargs -r kill -9
-
-    # Clean up log files. Use -f to avoid errors if files don't exist.
-    rm -f "$LOG_FILE"
-    rm -f "$BENCHMARK_LOG_FILE"
-    echo "Cleanup complete."
-}
 
 checkThroughputAndRouge() {
     # This function checks whether the ROUGE1 score and total token throughput
@@ -178,8 +197,8 @@ checkThroughputAndRouge() {
     # Extract ROUGE1 score
     actual_rouge1=$(grep -oP "'rouge1': \K[0-9.]+" "$BENCHMARK_LOG_FILE")
 
-    # Extract Total Token throughput
-    actual_throughput=$(awk '/Total Token throughput \(tok\/s\):/ {print $NF}' "$BENCHMARK_LOG_FILE")
+    # Extract Total token throughput
+    actual_throughput=$(awk '/Total token throughput \(tok\/s\):/ {print $NF}' "$BENCHMARK_LOG_FILE")
 
     echo "--- Extracted Values ---"
     if [ "$SKIP_ACCURACY_TESTS" = "True" ]; then
@@ -205,15 +224,15 @@ checkThroughputAndRouge() {
     echo
 
     if [ -z "$actual_throughput" ]; then
-        echo "Total Token throughput: NOT FOUND"
+        echo "Total token throughput: NOT FOUND"
         throughput_pass=0
     else
-        echo "Total Token throughput: $actual_throughput"
+        echo "Total token throughput: $actual_throughput"
         if awk -v actual="$actual_throughput" -v target="$TARGET_THROUGHPUT" 'BEGIN { exit !(actual >= target) }'; then
-            echo "Total Token throughput comparison (>= $TARGET_THROUGHPUT): PASSED"
+            echo "Total token throughput comparison (>= $TARGET_THROUGHPUT): PASSED"
             throughput_pass=1
         else
-            echo "Total Token throughput comparison (>= $TARGET_THROUGHPUT): FAILED"
+            echo "Total token throughput comparison (>= $TARGET_THROUGHPUT): FAILED"
             throughput_pass=0
         fi
     fi
@@ -259,11 +278,10 @@ for model_name in $model_list; do
     current_serve_args=("${extra_serve_args[@]}")
     max_batched_tokens=8192
     if [ "$USE_V6E8_QUEUE" == "True" ]; then
-        current_serve_args+=(--tensor-parallel-size 8)
         max_batched_tokens=1024
         if [ "$model_name" == "meta-llama/Llama-4-Scout-17B-16E-Instruct" ]; then
             current_serve_args+=(--hf-overrides '{"architectures": ["Llama4ForCausalLM"]}')
-        elif [ "$model_name" == "deepseek-ai/DeepSeek-R1-0528" ]; then
+        elif [ "$model_name" == "jrplatin/DeepSeek-R1-1D-Subchannel-256" ]; then
             current_serve_args+=(--hf_overrides '{"num_hidden_layers": 12}')
         fi
     fi
@@ -272,42 +290,20 @@ for model_name in $model_list; do
     echo "Spinning up the vLLM server..."
     (vllm serve "$model_name" --max-model-len=1024 --disable-log-requests --max-num-batched-tokens "$max_batched_tokens" "${current_serve_args[@]}" 2>&1 | tee -a "$LOG_FILE") &
 
+    # Set initial trap to ensure cleanup happens even on immediate exit
+    trap 'cleanUp "$model_name"' EXIT
 
+    waitForServerReady
 
-    # Run a busy loop to block until the server is ready to receive requests
-    did_find_ready_message=false
-    start_time=$(date +%s)
-    while true; do
-        current_time=$(date +%s)
-        elapsed_time=$((current_time - start_time))
-
-        sleep 5
-
-        # Check for timeout so we don't wait forever
-        if [[ "$elapsed_time" -ge "$TIMEOUT_SECONDS" ]]; then
-            echo "TIMEOUT: Waited $elapsed_time seconds (limit was $TIMEOUT_SECONDS). The string '$READY_MESSAGE' was NOT found."
-            cleanUp "$model_name"
-            exit 1
-        fi
-
-        if grep -q "$READY_MESSAGE" "$LOG_FILE" ; then
-            did_find_ready_message=true
-            break
-        fi
-    done
-
-
-
-    if $did_find_ready_message; then
-        echo "Starting the benchmark for $model_name..."
-        echo "Current working directory: $(pwd)"
-        python benchmarks/benchmark_serving.py \
-        --backend vllm \
-        --model "$model_name" \
-        --dataset-name "$dataset_name" \
-        --dataset-path "$dataset_path" \
-        --num-prompts "$num_prompts" \
-        --run-eval 2>&1 | tee -a "$BENCHMARK_LOG_FILE"
+    echo "Starting the benchmark for $model_name..."
+    echo "Current working directory: $(pwd)"
+    python benchmarks/benchmark_serving.py \
+    --backend vllm \
+    --model "$model_name" \
+    --dataset-name "$dataset_name" \
+    --dataset-path "$dataset_path" \
+    --num-prompts "$num_prompts" \
+    --run-eval 2>&1 | tee -a "$BENCHMARK_LOG_FILE"
 
         # TODO (jacobplatin): probably want to add an option to skip this in the future
         if [ "$dataset_name" == "mlperf" ]; then
@@ -316,12 +312,12 @@ for model_name in $model_list; do
                 exit_code=1
             fi
         fi
-    else
-        echo "vLLM server did not start successfully."
-        exit_code=1
-    fi
+
+    # Call cleanUp normally instead of using a trap
     cleanUp "$model_name"
 done
 
+# We successfully cleanUp every model, so cancel the trap.
+trap - EXIT
 
 exit $exit_code

@@ -1,3 +1,17 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -25,6 +39,9 @@ def mock_vllm_config():
     mock_parallel_conf = MagicMock()
     mock_parallel_conf.tensor_parallel_size = 2
     mock_parallel_conf.data_parallel_size = 1
+    mock_parallel_conf.pipeline_parallel_size = 1
+    mock_parallel_conf.nnodes = 1
+    mock_parallel_conf.nnodes_within_dp = 1
 
     mock_additional_config = {}
 
@@ -39,6 +56,16 @@ def mock_vllm_config():
     config.sharding_config.total_devices = 2
 
     return config
+
+
+@pytest.fixture
+def mock_get_pp_group():
+    with patch("tpu_inference.distributed.jax_parallel_state.get_pp_group",
+               return_value=MagicMock(is_first_rank=True,
+                                      is_last_rank=True,
+                                      rank_in_group=0,
+                                      world_size=1)):
+        yield
 
 
 class TestTPUWorker:
@@ -63,22 +90,20 @@ class TestTPUWorker:
         assert worker.profile_dir is None
         assert worker.devices == ['tpu:0']
 
-    @patch('tpu_inference.worker.tpu_worker.vllm_envs')
-    def test_init_with_profiler_on_rank_zero(self, mock_envs,
-                                             mock_vllm_config):
+    def test_init_with_profiler_on_rank_zero(self, mock_vllm_config):
         """Tests that the profiler directory is set correctly on rank 0."""
-        mock_envs.VLLM_TORCH_PROFILER_DIR = "/tmp/profiles"
+        mock_vllm_config.profiler_config.profiler = "torch"
+        mock_vllm_config.profiler_config.torch_profiler_dir = "/tmp/profiles"
         worker = TPUWorker(vllm_config=mock_vllm_config,
                            local_rank=0,
                            rank=0,
                            distributed_init_method="test_method")
         assert worker.profile_dir == "/tmp/profiles"
 
-    @patch('tpu_inference.worker.tpu_worker.vllm_envs')
-    def test_init_with_profiler_on_other_ranks(self, mock_envs,
-                                               mock_vllm_config):
+    def test_init_with_profiler_on_other_ranks(self, mock_vllm_config):
         """Tests that the profiler directory is NOT set on non-rank 0 workers."""
-        mock_envs.VLLM_TORCH_PROFILER_DIR = "/tmp/profiles"
+        mock_vllm_config.profiler_config.profiler = "torch"
+        mock_vllm_config.profiler_config.torch_profiler_dir = "/tmp/profiles"
         worker = TPUWorker(vllm_config=mock_vllm_config,
                            local_rank=1,
                            rank=1,
@@ -105,7 +130,7 @@ class TestTPUWorker:
     @patch('tpu_inference.worker.tpu_worker.ensure_kv_transfer_initialized')
     def test_init_device_with_provided_devices(
             self, mock_ensure_kv_transfer_initialized, mock_jax, mock_utils,
-            mock_runner_cls, mock_vllm_config):
+            mock_runner_cls, mock_vllm_config, mock_get_pp_group):
         """Tests init_device when devices are provided during construction."""
         mock_devices = ['tpu:0', 'tpu:1']
         worker = TPUWorker(vllm_config=mock_vllm_config,
@@ -116,8 +141,13 @@ class TestTPUWorker:
 
         worker.init_device()
 
-        mock_jax.devices.assert_not_called()
-        mock_runner_cls.assert_called_once_with(mock_vllm_config, mock_devices)
+        expected_rank = 0
+        expected_is_first_rank = True
+        expected_is_last_rank = True
+        mock_runner_cls.assert_called_once_with(mock_vllm_config, mock_devices,
+                                                expected_rank,
+                                                expected_is_first_rank,
+                                                expected_is_last_rank)
         assert isinstance(worker.model_runner, MagicMock)
 
     @patch('tpu_inference.worker.tpu_worker.TPUModelRunner')
@@ -135,15 +165,21 @@ class TestTPUWorker:
             distributed_init_method="test_method",
             devices=[]  # No devices provided, should trigger auto-detection
         )
+        mock_jax.device_count.return_value = 4
         mock_jax.devices.return_value = ['tpu:0', 'tpu:1', 'tpu:2', 'tpu:3']
 
         worker.init_device()
 
-        mock_jax.devices.assert_called_once()
         expected_devices = ['tpu:0', 'tpu:1']  # Sliced by tensor_parallel_size
         assert worker.devices == expected_devices
+        expected_rank = 0
+        expected_is_first_rank = True
+        expected_is_last_rank = True
         mock_runner_cls.assert_called_once_with(mock_vllm_config,
-                                                expected_devices)
+                                                expected_devices,
+                                                expected_rank,
+                                                expected_is_first_rank,
+                                                expected_is_last_rank)
 
     @patch('tpu_inference.worker.tpu_worker.utils')
     def test_determine_available_memory(self, mock_utils, mock_vllm_config):
@@ -192,7 +228,7 @@ class TestTPUWorker:
 
         # Assert the runner was called with the scheduler output directly
         worker.model_runner.execute_model.assert_called_once_with(
-            mock_scheduler_input)
+            mock_scheduler_input, None)
         # Assert the final result is the concrete model output
         assert result == mock_model_output
 
@@ -278,7 +314,7 @@ class TestTPUWorker:
         args, kwargs = mock_jax.profiler.start_trace.call_args
         assert args[0] == "/tmp/profile_dir"
         # Verify options from env var were used
-        assert kwargs['profiler_options'].python_tracer_level == '1'
+        assert kwargs['profiler_options'].python_tracer_level == 1
 
     @patch('tpu_inference.worker.tpu_worker.jax')
     def test_profile_stop(self, mock_jax, mock_vllm_config):
@@ -335,12 +371,13 @@ class TestTPUWorker:
                            rank=0,
                            distributed_init_method="test")
         worker.model_runner = MagicMock()
+        worker.topology_order_id = 0
         mock_input_config = MagicMock()
 
         worker.initialize_from_config(mock_input_config)
 
         worker.model_runner.initialize_kv_cache.assert_called_once_with(
-            mock_input_config)
+            mock_input_config, 0)
 
     def test_initialize_from_config_kv_cache_config(self, mock_vllm_config):
         """Tests the special case pass-through for initialize_from_config."""
@@ -349,12 +386,13 @@ class TestTPUWorker:
                            rank=0,
                            distributed_init_method="test")
         worker.model_runner = MagicMock()
+        worker.topology_order_id = 0
         mock_input_config = MagicMock(spec=KVCacheConfig)
 
         worker.initialize_from_config(mock_input_config)
 
         worker.model_runner.initialize_kv_cache.assert_called_once_with(
-            mock_input_config)
+            mock_input_config, 0)
 
     def test_compile_or_warm_up_model(self, mock_vllm_config):
         """Tests the special case pass-through for model compilation/warmup."""

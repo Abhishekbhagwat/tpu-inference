@@ -1,3 +1,17 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from typing import TYPE_CHECKING
 
 import jax
@@ -6,8 +20,6 @@ from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.multimodal.inputs import MultiModalKwargsItem, PlaceholderRange
 from vllm.multimodal.utils import group_mm_kwargs_by_modality
 from vllm.v1.core.sched.output import SchedulerOutput as VllmSchedulerOutput
-from vllm.v1.worker.utils import (gather_mm_placeholders,
-                                  scatter_mm_placeholders)
 
 from tpu_inference.models.jax.utils.multi_modal_utils import (
     flatten_embeddings, sanity_check_mm_encoder_outputs)
@@ -78,7 +90,7 @@ class MultiModalManager:
             return
 
         # Batch the multi-modal inputs.
-        mm_kwargs = list[MultiModalKwargsItem]()
+        mm_kwargs = list[tuple[str, MultiModalKwargsItem]]()
         # List of tuple (mm_hash, pos_info)
         mm_hashes_pos = list[tuple[str, PlaceholderRange]]()
         for req_id, encoder_input_ids in scheduled_encoder_inputs.items():
@@ -86,7 +98,7 @@ class MultiModalManager:
             for mm_input_id in encoder_input_ids:
                 mm_feature = req_state.mm_features[mm_input_id]
                 mm_hash = mm_feature.identifier
-                mm_kwargs.append(mm_feature.data)
+                mm_kwargs.append((mm_feature.modality, mm_feature.data))
                 mm_hashes_pos.append((mm_hash, mm_feature.mm_position))
 
         # Batch mm inputs as much as we can: if a request in the batch has
@@ -98,7 +110,7 @@ class MultiModalManager:
         # encoder outputs.
         encoder_outputs = []
         for _, num_items, mm_kwargs_group in group_mm_kwargs_by_modality(
-                mm_kwargs, merge_by_field_config=False):
+                mm_kwargs):
             batched_mm_inputs = mm_kwargs_group
             # Convert torch tensors to numpy arrays that JAX can handle.
             if "pixel_values" in batched_mm_inputs and isinstance(
@@ -134,7 +146,7 @@ class MultiModalManager:
             # 2. A list or tuple (length: num_items) of tensors, each of shape
             # (feature_size, hidden_size) in case the feature size is dynamic
             # depending on the input multimodal items.
-            curr_group_outputs = self.runner.get_multimodal_embeddings_fn(
+            curr_group_outputs = self.runner.embed_multimodal_fn(
                 self.runner.state, image_grid_thw, **batched_mm_inputs)
 
             sanity_check_mm_encoder_outputs(
@@ -146,17 +158,12 @@ class MultiModalManager:
                 encoder_outputs.append(output)
 
         # Cache the encoder outputs.
-        for (mm_hash, pos_info), output in zip(
+        for (mm_hash, _), output in zip(
                 mm_hashes_pos,
                 encoder_outputs,
         ):
-            if req_id not in self.runner.encoder_cache:
-                self.runner.encoder_cache[req_id] = {}
 
-            self.runner.encoder_cache[mm_hash] = scatter_mm_placeholders(
-                output,
-                is_embed=pos_info.is_embed,
-            )
+            self.runner.encoder_cache[mm_hash] = output
 
     def gather_mm_embeddings(self, scheduler_output: "VllmSchedulerOutput",
                              target_pad_len: int) -> list[jax.Array]:
@@ -189,6 +196,11 @@ class MultiModalManager:
                     num_computed_tokens - start_pos + num_scheduled_tokens,
                     num_encoder_tokens)
                 assert start_idx < end_idx
+                curr_embeds_start, curr_embeds_end = (
+                    pos_info.get_embeds_indices_in_range(start_idx, end_idx))
+                if curr_embeds_start == curr_embeds_end:
+                    continue
+
                 mm_hash = mm_feature.identifier
                 encoder_output = self.runner.encoder_cache.get(mm_hash, None)
                 assert encoder_output is not None,\
@@ -197,11 +209,11 @@ class MultiModalManager:
 
                 if (is_embed := pos_info.is_embed) is not None:
                     is_embed = is_embed[start_idx:end_idx]
+                    mm_embeds_item = encoder_output[
+                        curr_embeds_start:curr_embeds_end]
+                else:
+                    mm_embeds_item = encoder_output[start_idx:end_idx]
 
-                mm_embeds_item = gather_mm_placeholders(
-                    encoder_output[start_idx:end_idx],
-                    is_embed=is_embed,
-                )
                 mm_embeds.append(mm_embeds_item)
         if not mm_embeds:
             return None

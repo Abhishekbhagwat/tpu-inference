@@ -1,12 +1,26 @@
 #!/bin/bash
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 
 # Log the vLLM server output to a file
 LOG_FILE="server.log"
 BENCHMARK_LOG_FILE="benchmark.log"
 # The sentinel message that indicates the server is ready (in LOG_FILE)
-READY_MESSAGE="Application startup complete."
+export READY_MESSAGE="Application startup complete."
 # After how long we should timeout if the server doesn't start
-TIMEOUT_SECONDS=3600
+export TIMEOUT_SECONDS=3600
 
 test_model="meta-llama/Llama-3.1-8B-Instruct"
 if [ "$USE_V6E8_QUEUE" == "True" ]; then
@@ -44,6 +58,10 @@ helpFunction()
     echo "Example: export MAX_MODEL_LEN=...; export MAX_NUM_SEQS=...; export MAX_NUM_BATCHED_TOKENS=...; bash $0"
     exit 1
 }
+
+# Access shared benchmarking functionality
+# shellcheck disable=SC1091
+source "$(dirname "$0")/bench_utils.sh"
 
 while [[ "$#" -gt 0 ]]; do
     case "$1" in
@@ -117,18 +135,6 @@ echo "Using vLLM hash: $(git rev-parse HEAD)"
 # Overwrite a few of the vLLM benchmarking scripts with the TPU Commons ones
 cp -r "$root_dir"/tpu_inference/scripts/vllm/benchmarking/*.py "$root_dir"/vllm/benchmarks/
 echo "Using TPU Inference hash: $(git -C "$root_dir"/tpu_inference rev-parse HEAD)"
-
-cleanUp() {
-    echo "Stopping the vLLM server and cleaning up log files..."
-    pkill -f "vllm serve $1"
-    # Kill all processes related to vllm.
-    pgrep -f -i vllm | xargs -r kill -9
-
-    # Clean up log files. Use -f to avoid errors if files don't exist.
-    rm -f "$LOG_FILE"
-    rm -f "$BENCHMARK_LOG_FILE"
-    echo "Cleanup complete."
-}
 
 checkThroughput() {
     # This function checks whether the Request throughput from a benchmark
@@ -216,77 +222,44 @@ fi
 # Spin up the vLLM server
 echo "Spinning up the vLLM server..."
 if [[ "$test_model" == "RedHatAI/Meta-Llama-3.1-8B-Instruct-quantized.w8a8" ]]; then
-    (MODEL_IMPL_TYPE=vllm vllm serve "$test_model" --disable-log-requests --download_dir "$vllm_download_dir" --tensor-parallel-size "$tensor_parallel_size" "${extra_serve_args[@]}" 2>&1 | tee -a "$LOG_FILE") &
+    (vllm serve "$test_model" --disable-log-requests --download_dir "$vllm_download_dir" --tensor-parallel-size "$tensor_parallel_size" "${extra_serve_args[@]}" 2>&1 | tee -a "$LOG_FILE") &
 else
     (vllm serve "$test_model" --disable-log-requests --download_dir "$vllm_download_dir" --tensor-parallel-size "$tensor_parallel_size" "${extra_serve_args[@]}" 2>&1 | tee -a "$LOG_FILE") &
 fi
 
+# Set trap to ensure cleanup happens even on immediate or normal exit
+trap 'cleanUp "$test_model"' EXIT
 
-# Run a busy loop to block until the server is ready to receive requests
-did_find_ready_message=false
-start_time=$(date +%s)
-while true; do
-    current_time=$(date +%s)
-    elapsed_time=$((current_time - start_time))
+waitForServerReady
 
-    sleep 5
-
-    # Check for timeout so we don't wait forever
-    if [[ "$elapsed_time" -ge "$TIMEOUT_SECONDS" ]]; then
-        echo "TIMEOUT: Waited $elapsed_time seconds (limit was $TIMEOUT_SECONDS). The string '$READY_MESSAGE' was NOT found."
-        cleanUp "$test_model"
-        break
-    fi
-
-    if grep -Fq "raise RuntimeError" "$LOG_FILE"; then
-        echo "Detected RuntimeError, exiting."
-        break
-    fi
-
-    if grep -Fq "$READY_MESSAGE" "$LOG_FILE" ; then
-        echo "Application started"
-        did_find_ready_message=true
-        break
-    fi
-done
-
-
-if $did_find_ready_message; then
-    # Implement other dataset's args here
-    dataset_args=()
-    if [ "$dataset_name" = "sonnet" ]; then
-        dataset_args+=(
-            "--sonnet-input-len" "$input_len"
-            "--sonnet-output-len" "$output_len"
-            "--sonnet-prefix-len" "$prefix_len"
-        )
-    elif [ "$dataset_name" = "random" ]; then
-        dataset_args+=(
-            "--random-input-len" "$input_len"
-            "--random-output-len" "$output_len"
-            "--random-prefix-len" "$prefix_len"
-        )
-    fi
-
-    echo "Starting the benchmark for $test_model..."
-    echo "Current working directory: $(pwd)"
-    python benchmarks/benchmark_serving.py \
-    --backend vllm \
-    --model "$test_model" \
-    --dataset-name "$dataset_name" \
-    --dataset-path "$dataset_path" \
-    "${dataset_args[@]}" 2>&1 | tee -a "$BENCHMARK_LOG_FILE"
-
-    checkThroughput
-    if [ "$exit_code" -ne 0 ]; then
-        exit_code=1
-    fi
-else
-    echo "vLLM server did not start successfully."
-    exit_code=1
+# Implement other dataset's args here
+dataset_args=()
+if [ "$dataset_name" = "sonnet" ]; then
+    dataset_args+=(
+        "--sonnet-input-len" "$input_len"
+        "--sonnet-output-len" "$output_len"
+        "--sonnet-prefix-len" "$prefix_len"
+    )
+elif [ "$dataset_name" = "random" ]; then
+    dataset_args+=(
+        "--random-input-len" "$input_len"
+        "--random-output-len" "$output_len"
+        "--random-prefix-len" "$prefix_len"
+    )
 fi
 
-cleanUp "$test_model"
+echo "Starting the benchmark for $test_model..."
+echo "Current working directory: $(pwd)"
+python benchmarks/benchmark_serving.py \
+--backend vllm \
+--model "$test_model" \
+--dataset-name "$dataset_name" \
+--dataset-path "$dataset_path" \
+"${dataset_args[@]}" 2>&1 | tee -a "$BENCHMARK_LOG_FILE"
 
+checkThroughput
+if [ "$exit_code" -ne 0 ]; then
+    exit_code=1
+fi
 
 exit $exit_code

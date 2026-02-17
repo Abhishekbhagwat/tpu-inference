@@ -1,3 +1,17 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -281,9 +295,6 @@ class TestTPUConnectorWorker(unittest.TestCase):
         patchers = {
             "jax":
             patch('tpu_inference.distributed.tpu_connector.jax'),
-            "get_node_id":
-            patch('tpu_inference.distributed.tpu_connector.get_node_id',
-                  return_value=0),
             "get_host_ip":
             patch('tpu_inference.distributed.tpu_connector.get_host_ip',
                   return_value='127.0.0.1'),
@@ -331,7 +342,6 @@ class TestTPUConnectorWorker(unittest.TestCase):
         self.vllm_config.kv_transfer_config.is_kv_producer = True
         worker = tpu_connector.TPUConnectorWorker(self.vllm_config)
 
-        self.all_mocks["start_transfer_server"].assert_called_once()
         self.all_mocks["zmq"].Context.assert_called_once()
         self.all_mocks["threading"].Thread.assert_called_once()
         self.all_mocks["threading"].Event.assert_called()
@@ -343,7 +353,6 @@ class TestTPUConnectorWorker(unittest.TestCase):
         self.vllm_config.kv_transfer_config.is_kv_producer = False
         worker = tpu_connector.TPUConnectorWorker(self.vllm_config)
 
-        self.all_mocks["start_transfer_server"].assert_called_once()
         self.all_mocks["zmq"].Context.assert_called_once()
         self.all_mocks["threading"].Thread.assert_not_called()
         self.all_mocks["ThreadPoolExecutor"].assert_called_once_with(
@@ -365,6 +374,7 @@ class TestTPUConnectorWorker(unittest.TestCase):
 
         worker.register_runner(mock_runner)
 
+        self.all_mocks["start_transfer_server"].assert_called_once()
         self.assertEqual(worker.runner, mock_runner)
         self.assertEqual(worker.mesh, 'mesh')
         self.assertEqual(worker.num_layers, 5)
@@ -407,7 +417,7 @@ class TestTPUConnectorWorker(unittest.TestCase):
         worker._maybe_build_kv_connection.assert_called_once_with(load_meta)
         self.all_mocks[
             "ThreadPoolExecutor"].return_value.submit.assert_called_once_with(
-                worker._pull_kv, "conn", load_meta)
+                worker._pull_kv, "req1", "conn", load_meta)
 
     def test_process_send_load_for_consumer_notifying(self):
         """Tests process_send_load for a consumer that needs to notify."""
@@ -415,9 +425,9 @@ class TestTPUConnectorWorker(unittest.TestCase):
         worker = tpu_connector.TPUConnectorWorker(self.vllm_config)
         worker._maybe_build_notif_socket = MagicMock(return_value="socket")
         worker._notify_pull_done = MagicMock()
-
+        uuid = 10
         meta = tpu_connector.TPUConnectorMetadata()
-        load_meta = tpu_connector.LoadMeta(uuid=1,
+        load_meta = tpu_connector.LoadMeta(uuid=uuid,
                                            local_block_ids=None,
                                            remote_block_ids=None,
                                            remote_host="host",
@@ -427,7 +437,8 @@ class TestTPUConnectorWorker(unittest.TestCase):
         worker.process_send_load(meta)
 
         worker._maybe_build_notif_socket.assert_called_once_with(load_meta)
-        worker._notify_pull_done.assert_called_once_with("socket", "req1")
+        worker._notify_pull_done.assert_called_once_with(
+            "socket", "req1", uuid)
 
     def test_get_finished_recving(self):
         """Tests get_finished for a request that has finished pulling."""

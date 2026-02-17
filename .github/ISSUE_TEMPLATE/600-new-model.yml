@@ -1,3 +1,17 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 name: 🤗 Support request for a new model from huggingface
 description: Submit a proposal/request for a new model from huggingface
 title: "[New Model]: "
@@ -21,7 +35,10 @@ body:
   attributes:
     label: The closest model TPU Inference already supports.
     description: >
-      Here is the list of models already supported by TPU Inference: https://github.com/vllm-project/tpu-inference/blob/main/support_matrices/model_support_matrix.csv . Which model is the most similar to the model you want to add support for?
+      Here are the lists of models already supported by TPU Inference:
+      * Text-Only Models: https://github.com/vllm-project/tpu-inference/blob/main/support_matrices/text_only_model_support_matrix.csv
+      * Multimodal Models: https://github.com/vllm-project/tpu-inference/blob/main/support_matrices/multimodal_model_support_matrix.csv
+      Which model is the most similar to the model you want to add support for?
 - type: textarea
   attributes:
     label: What's your difficulty of supporting the model you want?

@@ -1,12 +1,27 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jax.sharding import Sharding
+from jax import lax
+from jax.sharding import NamedSharding, Sharding
 
-from tpu_inference import utils
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
+from tpu_inference.layers.common.quantization import quantize_kv
 from tpu_inference.layers.jax.attention.attention import Attention, KVCache
 from tpu_inference.layers.jax.rope_interface import apply_rope
 from tpu_inference.logger import init_logger
@@ -69,8 +84,8 @@ class Llama4Attention(Attention):
         """
         md = attention_metadata
         x = jnp.asarray(x, self.dtype)
-        x_SD = nnx.with_sharding_constraint(x, self.activation_attention_td)
-        x_q_TD = nnx.with_sharding_constraint(x, self.activation_q_td)
+        x_SD = lax.with_sharding_constraint(x, self.activation_attention_td)
+        x_q_TD = lax.with_sharding_constraint(x, self.activation_q_td)
         rope_scaling = self.rope_scaling
         rope_theta = self.rope_theta
         H = self.head_dim
@@ -90,7 +105,8 @@ class Llama4Attention(Attention):
                 if self.temperature_tuning:
                     q_TNH = self.apply_temperature_tuning(md, q_TNH)
 
-            q_TNH = nnx.with_sharding_constraint(q_TNH, self.query_tnh)
+            q_TNH = lax.with_sharding_constraint(
+                q_TNH, NamedSharding(self.mesh, self.query_tnh))
         with jax.named_scope("k_proj"):
             k_SKH = jnp.einsum('SD,DKH -> SKH', x_SD,
                                self.kernel_k_proj_DKH.value)
@@ -101,12 +117,14 @@ class Llama4Attention(Attention):
                 # Apply normaliation after RoPE
                 if self.use_qk_norm:
                     k_SKH = l2_norm(k_SKH)
-            k_SKH = nnx.with_sharding_constraint(k_SKH, self.keyvalue_skh)
+            k_SKH = lax.with_sharding_constraint(
+                k_SKH, NamedSharding(self.mesh, self.keyvalue_skh))
 
         with jax.named_scope("v_proj"):
             v_SKH = jnp.einsum('SD,DKH -> SKH', x_SD,
                                self.kernel_v_proj_DKH.value)
-            v_SKH = nnx.with_sharding_constraint(v_SKH, self.keyvalue_skh)
+            v_SKH = lax.with_sharding_constraint(
+                v_SKH, NamedSharding(self.mesh, self.keyvalue_skh))
 
         q_scale = k_scale = v_scale = None
         if self.kv_cache_quantized_dtype:
@@ -114,9 +132,8 @@ class Llama4Attention(Attention):
             # q_scale = self._q_scale
             k_scale = self._k_scale
             v_scale = self._v_scale
-            k_SKH, v_SKH = utils.quantize_kv(k_SKH, v_SKH,
-                                             self.kv_cache_quantized_dtype,
-                                             k_scale, v_scale)
+            k_SKH, v_SKH = quantize_kv(self.kv_cache_quantized_dtype, k_SKH,
+                                       v_SKH, k_scale, v_scale)
 
         with jax.named_scope("attn_op"):
             new_kv_cache, outputs_TNH = self.attention(
@@ -135,7 +152,7 @@ class Llama4Attention(Attention):
         with jax.named_scope("o_proj"):
             o_TD = jnp.einsum('TNH,NHD -> TD', outputs_TNH,
                               self.kernel_o_proj_NHD.value)
-            o_TD = nnx.with_sharding_constraint(
+            o_TD = lax.with_sharding_constraint(
                 o_TD, self.activation_attention_out_td)
         return new_kv_cache, o_TD
 

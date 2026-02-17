@@ -1,3 +1,17 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from dataclasses import InitVar, dataclass
 from typing import Tuple
 
@@ -5,7 +19,6 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from flax.typing import Sharding
-from jax.experimental import shard_map
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
@@ -13,6 +26,7 @@ from tpu_inference import utils
 from tpu_inference.kernels.ragged_paged_attention.v3.kernel_hd64 import \
     ragged_paged_attention_hd64
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
+from tpu_inference.layers.common.quantization import quantize_kv
 from tpu_inference.layers.jax.base import create_param
 from tpu_inference.layers.jax.rope import GptOssRotaryEmbedding
 
@@ -158,17 +172,17 @@ class GptOssAttention(nnx.Module):
     ) -> Tuple[KVCache, jax.Array]:
         """Performs scaled dot-product attention by calling the ragged_paged_attention kernel."""
         md = attention_metadata
-        kv_cache_spec = P(None, None, "model")
+        kv_cache_spec = P("data", None, "model")
 
         in_specs = (
             self.query_tnh,  # q
             self.keyvalue_skh,  # k
             self.keyvalue_skh,  # v
             kv_cache_spec,  # kv_cache
-            P(),  # md.seq_lens: Replicated
-            P(),  # page_indices_flat: Replicated
-            P(),  # query_start_loc: Replicated
-            P(),  # distribution: Replicated
+            P("data"),  # md.seq_lens
+            P("data"),  # page_indices_flat
+            P("data"),  # query_start_loc
+            P("data"),  # distribution
             P(('model')),  # sinks
         )
         out_specs = (self.attn_o_tnh, kv_cache_spec)
@@ -185,12 +199,12 @@ class GptOssAttention(nnx.Module):
             )
 
         output_TNH, kv_cache = jax.jit(
-            shard_map.shard_map(
+            jax.shard_map(
                 _ragged_paged_attention_wrapper,
                 mesh=mesh,
                 in_specs=in_specs,
                 out_specs=out_specs,
-                check_rep=False,
+                check_vma=False,
             ))(
                 q_TNH,
                 k_SKH,
@@ -235,9 +249,8 @@ class GptOssAttention(nnx.Module):
             # q_scale = self._q_scale
             k_scale = self._k_scale
             v_scale = self._v_scale
-            k_TKH, v_TKH = utils.quantize_kv(k_TKH, v_TKH,
-                                             self.kv_cache_quantized_dtype,
-                                             k_scale, v_scale)
+            k_TKH, v_TKH = quantize_kv(self.kv_cache_quantized_dtype, k_TKH,
+                                       v_TKH, k_scale, v_scale)
 
         with jax.named_scope("attn_op"):
             new_kv_cache, attn_out_TNH = self.attention(

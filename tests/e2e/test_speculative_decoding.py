@@ -1,11 +1,39 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
+import os
 import random
 import string
 import time
 
 import pytest
 from vllm import LLM, SamplingParams
+
+
+# TODO (Qiliang Cui): remove this when XLA fixes the recursive jit call issue.
+def _is_v7x():
+    # jax.devices() will hang so use IS_FOR_V7X to indicate the version.
+    return os.environ.get("IS_FOR_V7X", "false") == "true"
+
+
+def _get_tensor_parallel_size():
+    # Work around an XLA issue.
+    if _is_v7x():
+        return 2
+    return 1
 
 
 def get_ngram_test_prompts():
@@ -73,7 +101,11 @@ def _test_correctness_helper(
     with monkeypatch.context():
         test_prompts = get_test_prompts(speculative_config)
 
-        ref_llm = LLM(model=model_name, max_model_len=1024, max_num_seqs=4)
+        ref_llm = LLM(model=model_name,
+                      max_model_len=1024,
+                      max_num_seqs=4,
+                      tensor_parallel_size=_get_tensor_parallel_size(),
+                      async_scheduling=0)
         ref_outputs = ref_llm.generate(test_prompts, sampling_config)
 
         del ref_llm
@@ -84,7 +116,9 @@ def _test_correctness_helper(
         spec_llm = LLM(model=model_name,
                        speculative_config=speculative_config,
                        max_model_len=1024,
-                       max_num_seqs=4)
+                       max_num_seqs=4,
+                       tensor_parallel_size=_get_tensor_parallel_size(),
+                       async_scheduling=0)
         spec_outputs = spec_llm.generate(test_prompts, sampling_config)
 
         matches = 0
@@ -165,7 +199,9 @@ def _test_performance_helper(
         ref_llm = LLM(model=model_name,
                       max_model_len=1024,
                       max_num_seqs=1,
-                      enable_prefix_caching=False)
+                      enable_prefix_caching=False,
+                      tensor_parallel_size=_get_tensor_parallel_size(),
+                      async_scheduling=0)
 
         start_time = time.time()
         _ = ref_llm.generate(test_prompts, sampling_config)
@@ -174,14 +210,16 @@ def _test_performance_helper(
         del ref_llm
 
         # Waiting for TPUs to be released
-        time.sleep(10)
+        time.sleep(30)
 
         # Test speculative LLM timing with max_num_seqs=1
         spec_llm = LLM(model=model_name,
                        speculative_config=speculative_config,
                        max_model_len=1024,
                        max_num_seqs=1,
-                       enable_prefix_caching=False)
+                       tensor_parallel_size=_get_tensor_parallel_size(),
+                       enable_prefix_caching=False,
+                       async_scheduling=0)
 
         start_time = time.time()
         _ = spec_llm.generate(test_prompts, sampling_config)
@@ -189,7 +227,7 @@ def _test_performance_helper(
 
         del spec_llm
         # Waiting for TPUs to be released
-        time.sleep(10)
+        time.sleep(30)
 
         speedup = ref_time / spec_time
         print(f"Reference LLM time: {ref_time:.2f}s")
@@ -215,7 +253,7 @@ def test_ngram_performance_greedy(
             "prompt_lookup_max": 2,
             "prompt_lookup_min": 2,
             "num_speculative_tokens": 4,
-        }, 3.0)
+        }, 1.2 if _is_v7x() else 3.0)
 
 
 def test_ngram_performance_random(
@@ -237,7 +275,7 @@ def test_ngram_performance_random(
             "prompt_lookup_max": 2,
             "prompt_lookup_min": 2,
             "num_speculative_tokens": 4,
-        }, 3.0)
+        }, 1.2 if _is_v7x() else 3.0)
 
 
 def test_eagle3_correctness(
@@ -274,4 +312,4 @@ def test_eagle3_performance(
             "model": "unkmaster/EAGLE3-LLaMA3.1-Instruct-8B",
             "num_speculative_tokens": 2,
             "draft_tensor_parallel_size": 1
-        }, 1.8)
+        }, 0.6 if _is_v7x() else 1.8)

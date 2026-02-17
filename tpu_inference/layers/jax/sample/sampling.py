@@ -1,3 +1,17 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import functools
 
 import jax
@@ -28,14 +42,23 @@ def sample(
     if tpu_sampling_metadata.do_sampling:
         # Unshard the logits explicity to avoid latency increase.
         logits = jax.lax.with_sharding_constraint(
-            logits, NamedSharding(mesh, P(ShardingAxisName.ATTN_DATA, None)))
+            logits, NamedSharding(mesh, P(ShardingAxisName.MLP_DATA, None)))
     greedy_sampled = jnp.argmax(logits, axis=-1)
     if not tpu_sampling_metadata.do_sampling:
         return greedy_sampled
 
     logits = logits.astype(jnp.float32)
-    logits = topk_mask(logits, tpu_sampling_metadata.top_k, replace_val=-1e12)
-    logits = topp_mask(logits, tpu_sampling_metadata.top_p, replace_val=-1e12)
+    # Only apply top-k masking if k > 0 for each token
+    top_k = tpu_sampling_metadata.top_k
+    should_apply_topk = jnp.expand_dims(top_k > 0, axis=-1)
+    topk_masked = topk_mask(logits, top_k, replace_val=-1e12)
+    logits = jnp.where(should_apply_topk, topk_masked, logits)
+
+    # Only apply top-p masking if p < 1.0 for each token
+    top_p = tpu_sampling_metadata.top_p
+    should_apply_topp = jnp.expand_dims(top_p < 1.0, axis=-1)
+    topp_masked = topp_mask(logits, top_p, replace_val=-1e12)
+    logits = jnp.where(should_apply_topp, topp_masked, logits)
 
     temperatures = tpu_sampling_metadata.temperature.astype(logits.dtype)
     temperatures = jnp.expand_dims(temperatures, axis=-1)

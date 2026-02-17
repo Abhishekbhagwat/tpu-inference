@@ -1,3 +1,17 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -10,10 +24,13 @@ class MockVllmConfig:
         self.parallel_config = MagicMock()
         self.parallel_config.world_size = 4
         self.parallel_config.tensor_parallel_size = 2
-        self.parallel_config.pipeline_parallel_size = 2
+        self.parallel_config.pipeline_parallel_size = 1
         self.parallel_config.ray_workers_use_nsight = False
         self.parallel_config.placement_group = None
         self.parallel_config.max_parallel_loading_workers = None
+
+        self.sharding_config = MagicMock()
+        self.sharding_config.total_devices = 2
 
         self.model_config = MagicMock()
         self.cache_config = MagicMock()
@@ -24,6 +41,7 @@ class MockVllmConfig:
         self.prompt_adapter_config = MagicMock()
         self.observability_config = MagicMock()
         self.device_config = MagicMock()
+        self.ec_transfer_config = MagicMock()
 
 
 @patch(
@@ -127,6 +145,8 @@ class TestTpuRayDistributedExecutor(unittest.TestCase):
         }
 
         executor = self.RayDistributedExecutor(self.vllm_config)
+        executor.vllm_config = self.vllm_config
+        executor.parallel_config = self.vllm_config.parallel_config
 
         # --- Test and Assert ---
         with self.assertRaisesRegex(ValueError,

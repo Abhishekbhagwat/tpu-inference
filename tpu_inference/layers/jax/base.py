@@ -1,3 +1,17 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import dataclasses
 from dataclasses import dataclass, fields
 from typing import Any, Callable, Mapping
@@ -15,8 +29,8 @@ Initializer = Callable[..., jax.Array]
 logger = init_logger(__name__)
 
 # Define singleton initializers to avoid re-compilation.
-_scale_initializer = nnx.initializers.ones
-_sharded_initializer = nnx.initializers.xavier_normal()
+scale_initializer = nnx.initializers.ones
+sharded_initializer = nnx.initializers.xavier_normal()
 _init_fn = nnx.initializers.uniform()
 
 
@@ -139,13 +153,17 @@ def create_param(rngs: nnx.Rngs,
                  random_init=False) -> nnx.Param:
     key = rngs.params()
     if random_init:
-        initializer = _scale_initializer if len(
-            shape) == 1 else _sharded_initializer
+        initializer = scale_initializer if len(
+            shape) == 1 else sharded_initializer
 
         jitted_initializer = jax.jit(initializer,
                                      static_argnames=('shape', 'dtype'),
                                      out_shardings=P(*sharding))
         param_data = jitted_initializer(key, shape, dtype)
-        return nnx.Param(param_data, sharding=sharding)
+        return nnx.Param(param_data,
+                         sharding=sharding,
+                         init_fn=jitted_initializer)
     else:
-        return nnx.Param(_init_fn(key, shape, dtype), sharding=sharding)
+        return nnx.Param(_init_fn(key, shape, dtype),
+                         sharding=sharding,
+                         init_fn=_init_fn)

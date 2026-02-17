@@ -1,3 +1,17 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from unittest.mock import MagicMock, patch
 
 import jax
@@ -5,11 +19,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
-from vllm.attention import Attention
-from vllm.attention.backends.abstract import AttentionType
 from vllm.config import (CacheConfig, ModelConfig, ParallelConfig,
                          SchedulerConfig, VllmConfig)
+from vllm.model_executor.layers.attention import Attention
 from vllm.sampling_params import SamplingType
+from vllm.v1.attention.backend import AttentionType
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheGroupSpec, KVCacheTensor,
                                         MLAAttentionSpec, SlidingWindowSpec)
@@ -17,43 +31,47 @@ from vllm.v1.request import Request
 
 from tpu_inference import utils as common_utils
 from tpu_inference.runner.input_batch import CachedRequestState
+from tpu_inference.runner.kv_cache import get_attention_page_size_bytes
 from tpu_inference.runner.tpu_runner import TPUModelRunner
 
 
 class TestKVCacheManager:
 
-    def setup_method(self):
+    def _setup_runner(self, use_mla: bool = False):
         # Mock JAX dependencies
+        self.mock_rng_key = MagicMock()
+
         self.mock_devices = [MagicMock(coords=i) for i in range(4)]
         self.mock_rng_key = MagicMock()
 
         # create 1x1 mesh
         devices = np.asarray(jax.devices()[:1])
-        axis_names = ('data', 'attn_dp', 'model')
-        mesh_shape = (1, 1, 1)
+        axis_names = ('data', 'attn_dp', 'model', 'expert')
+        mesh_shape = (1, 1, 1, 1)
         self.mock_mesh = jax.sharding.Mesh(devices.reshape(mesh_shape),
                                            axis_names)
 
         with patch('jax.devices', return_value=self.mock_devices), \
              patch('jax.make_mesh', return_value=self.mock_mesh), \
+             patch('jax.experimental.mesh_utils.create_device_mesh', return_value=self.mock_mesh), \
+             patch('tpu_inference.runner.tpu_runner.TPUModelRunner._create_new_model_mesh', return_value=self.mock_mesh), \
+             patch('tpu_inference.runner.tpu_runner.TPUModelRunner._init_mesh', return_value=self.mock_mesh), \
              patch('jax.random.key', return_value=self.mock_rng_key), \
              patch('tpu_inference.runner.tpu_runner.get_model', return_value=MagicMock()):
 
-            model_config = ModelConfig(tokenizer_mode="auto",
-                                       trust_remote_code=False,
-                                       seed=0,
-                                       dtype='bfloat16')
+            model_config = ModelConfig()
             cache_config = CacheConfig(
                 block_size=16,
                 gpu_memory_utilization=0.9,
                 swap_space=4,
                 cache_dtype="auto",
             )
-            scheduler_config = SchedulerConfig(max_num_seqs=16, )
+            scheduler_config = SchedulerConfig(max_num_seqs=16,
+                                               max_model_len=1024,
+                                               is_encoder_decoder=False)
             parallel_config = ParallelConfig(
                 pipeline_parallel_size=1,
                 tensor_parallel_size=1,
-                worker_use_ray=False,
             )
             vllm_config = VllmConfig(
                 model_config=model_config,
@@ -63,9 +81,12 @@ class TestKVCacheManager:
                 observability_config={},
                 additional_config={},
             )
-
             self.runner = TPUModelRunner(vllm_config,
                                          devices=self.mock_devices)
+            self.runner.mesh = self.mock_mesh
+
+    def setup_method(self):
+        self._setup_runner(use_mla=False)
 
     def test_insert_request_with_kv_cache(self):
         # This test refines the insertion test by first extracting a KV cache
@@ -244,19 +265,28 @@ class TestKVCacheManager:
 
         kv_cache_spec = self.runner.get_kv_cache_spec()
 
+        block_size = self.runner.vllm_config.cache_config.block_size
+        num_kv_heads = common_utils.get_padded_num_heads(
+            num_kv_heads, self.runner.mesh.shape["model"])
+        head_size = common_utils.get_padded_head_dim(head_size)
+
         expected_full_attn_spec = FullAttentionSpec(
-            block_size=self.runner.vllm_config.cache_config.block_size,
-            num_kv_heads=common_utils.get_padded_num_heads(
-                num_kv_heads, self.runner.mesh.shape["model"]),
-            head_size=common_utils.get_padded_head_dim(head_size),
-            dtype=torch.bfloat16)
-        expected_sliding_window_spec = SlidingWindowSpec(
-            block_size=self.runner.vllm_config.cache_config.block_size,
-            num_kv_heads=common_utils.get_padded_num_heads(
-                num_kv_heads, self.runner.mesh.shape["model"]),
-            head_size=common_utils.get_padded_head_dim(head_size),
+            block_size=block_size,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
             dtype=torch.bfloat16,
-            sliding_window=sliding_window)
+            page_size_padded=get_attention_page_size_bytes(
+                self.runner.mesh, block_size, num_kv_heads, head_size,
+                self.runner.kv_cache_dtype, False))
+        expected_sliding_window_spec = SlidingWindowSpec(
+            block_size=block_size,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            dtype=torch.bfloat16,
+            sliding_window=sliding_window,
+            page_size_padded=get_attention_page_size_bytes(
+                self.runner.mesh, block_size, num_kv_heads, head_size,
+                self.runner.kv_cache_dtype, False))
         assert len(kv_cache_spec) == 20
         for i in range(10):
             assert kv_cache_spec[f'layer.{i}'] == expected_full_attn_spec
@@ -269,12 +299,17 @@ class TestKVCacheManager:
 
     def test_get_kv_cache_spec_with_compilation_cfg_mla(self):
         # tests we create kv cache spec from compilation config with mla
-        # Set config for use_mla to be true
-        self.runner.model_config.hf_config.model_type = "deepseek_v2"
-        self.runner.model_config.hf_config.kv_lora_rank = 64
+        self.runner.kv_cache_manager.use_mla = True
+
+        # Mock hf_text_config to have kv_lora_rank and qk_rope_head_dim
+        mock_hf_text_config = MagicMock()
+        mock_hf_text_config.kv_lora_rank = 400
+        mock_hf_text_config.qk_rope_head_dim = 40
+        self.runner.model_config.hf_text_config = mock_hf_text_config
 
         num_kv_heads = 16
-        head_size = 128
+        head_size = 512  # Aggregated padding amount may be passed to the model instead.
+        expected_head_size = 640  # 640 = align(512, 128) + alignto(40, 128)
         attn_type = AttentionType.DECODER
         static_forward_context = {}
         # Mock one layer, as the logic is the same for all
@@ -286,32 +321,18 @@ class TestKVCacheManager:
             sliding_window=None,
             kv_sharing_target_layer_name=None,
         )
+        mock_attn_module.use_mla = True
         static_forward_context['layer.0'] = mock_attn_module
         self.runner.vllm_config.compilation_config.static_forward_context = \
             static_forward_context
 
-        # The loop in get_kv_cache_spec uses 'i', which is not defined
-        # when iterating over a dict. Let's patch it to work for this test.
-        # The original code seems to have a bug here.
-        with patch.object(self.runner.kv_cache_manager,
-                          'get_kv_cache_spec') as mock_get_spec:
-
-            def side_effect():
-                spec = {}
-                spec['layer.0'] = MLAAttentionSpec(
-                    block_size=self.runner.cache_config.block_size,
-                    num_kv_heads=mock_attn_module.num_kv_heads,
-                    head_size=mock_attn_module.head_size,
-                    dtype=self.runner.kv_cache_dtype,
-                    cache_dtype_str=self.runner.vllm_config.cache_config.
-                    cache_dtype)
-                return spec
-
-            mock_get_spec.side_effect = side_effect
-            kv_cache_spec = self.runner.get_kv_cache_spec()
+        kv_cache_spec = self.runner.get_kv_cache_spec()
 
         assert len(kv_cache_spec) == 1
-        assert isinstance(kv_cache_spec['layer.0'], MLAAttentionSpec)
+        spec = kv_cache_spec['layer.0']
+        assert isinstance(spec, MLAAttentionSpec)
+        assert spec.num_kv_heads == 1
+        assert spec.head_size == expected_head_size
 
     def test_get_kv_cache_spec_without_compilation_cfg(self):
         # tests if there's no compilation config, we use full attention kv
@@ -326,41 +347,45 @@ class TestKVCacheManager:
         kv_cache_spec = self.runner.get_kv_cache_spec()
 
         assert len(kv_cache_spec) == num_layers
+        block_size = self.runner.vllm_config.cache_config.block_size
+        num_kv_heads = common_utils.get_padded_num_heads(
+            num_kv_heads, self.runner.mesh.shape["model"])
+        head_size = common_utils.get_padded_head_dim(head_size)
         expected_full_attn_spec = FullAttentionSpec(
-            block_size=self.runner.vllm_config.cache_config.block_size,
-            num_kv_heads=common_utils.get_padded_num_heads(
-                num_kv_heads, self.runner.mesh.shape["model"]),
-            head_size=common_utils.get_padded_head_dim(head_size),
-            dtype=torch.bfloat16)
+            block_size=block_size,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            dtype=torch.bfloat16,
+            page_size_padded=get_attention_page_size_bytes(
+                self.runner.mesh, block_size, num_kv_heads, head_size,
+                self.runner.kv_cache_dtype, False))
         for i in range(num_layers):
             assert kv_cache_spec[f'layer.{i}'] == expected_full_attn_spec
         assert len(self.runner.kv_cache_manager.shared_kv_cache_layers) == 0
 
     def test_get_kv_cache_spec_without_compilation_cfg_mla(self):
-        # tests if there's no compilation config, we use mla spec
-        # Set config for use_mla to be true
-        self.runner.model_config.hf_config.model_type = "deepseek_v2"
-        self.runner.model_config.hf_config.kv_lora_rank = 64
-
+        self.runner.kv_cache_manager.use_mla = True
         model_config = self.runner.vllm_config.model_config
         parallel_config = self.runner.vllm_config.parallel_config
         num_layers = model_config.get_num_layers(parallel_config)
 
-        self.runner.vllm_config.compilation_config.static_forward_context = {}
+        mock_hf_text_config = MagicMock()
+        mock_hf_text_config.kv_lora_rank = 400
+        mock_hf_text_config.qk_rope_head_dim = 40
+        self.runner.model_config.hf_text_config = mock_hf_text_config
+        expected_head_size = 640  # 640 = align(512, 128) + alignto(40, 128)
 
-        # The original code has a bug where attn_module is not defined.
-        # We'll mock the behavior for the test.
-        with patch.object(self.runner.kv_cache_manager,
-                          'get_kv_cache_spec') as mock_get_spec:
-            mock_get_spec.return_value = {
-                f"layer.{i}": MagicMock(spec=MLAAttentionSpec)
-                for i in range(num_layers)
-            }
+        self.runner.vllm_config.compilation_config.static_forward_context = {}
+        with patch('vllm.config.ModelConfig.get_num_layers',
+                   return_value=num_layers):
             kv_cache_spec = self.runner.get_kv_cache_spec()
 
         assert len(kv_cache_spec) == num_layers
         for i in range(num_layers):
-            assert isinstance(kv_cache_spec[f'layer.{i}'], MLAAttentionSpec)
+            spec = kv_cache_spec[f"layer.{i}"]
+            assert isinstance(spec, MLAAttentionSpec)
+            assert spec.num_kv_heads == 1
+            assert spec.head_size == expected_head_size
 
     def test_initialize_kv_cache(self):
         # create a kv cache config with 10 layers full attention and 10 layers
@@ -447,9 +472,7 @@ class TestKVCacheManager:
 
     def test_get_kv_cache_spec_with_eagle3_mla(self):
         # tests we create kv cache spec for eagle3 draft model with mla
-        # Set config for use_mla to be true
-        self.runner.model_config.hf_config.model_type = "deepseek_v2"
-        self.runner.model_config.hf_config.kv_lora_rank = 64
+        self.runner.kv_cache_manager.use_mla = True
 
         self.runner.vllm_config.compilation_config.static_forward_context = {}
         mock_speculative_config = MagicMock()
@@ -459,18 +482,28 @@ class TestKVCacheManager:
         mock_hf_config.num_key_value_heads = 4
         mock_hf_config.hidden_size = 1024
         mock_hf_config.num_attention_heads = 8
+        mock_hf_config.num_layers = 16
+        model_layers = 1
+        mock_hf_text_config = MagicMock()
+        mock_hf_text_config.kv_lora_rank = 400
+        mock_hf_text_config.qk_rope_head_dim = 40
+        self.runner.model_config.hf_text_config = mock_hf_text_config
         mock_draft_model_config.hf_config = mock_hf_config
         mock_speculative_config.draft_model_config = mock_draft_model_config
         self.runner.speculative_config = mock_speculative_config
 
-        # The original code has a bug where attn_module is not defined.
-        # We'll mock the behavior for the test.
-        with patch.object(self.runner.kv_cache_manager,
-                          'get_kv_cache_spec') as mock_get_spec:
-            mock_get_spec.return_value = {
-                "layer.0": MagicMock(spec=MLAAttentionSpec)
-            }
-            kv_cache_spec = self.runner.get_kv_cache_spec()
+        kv_cache_spec = self.runner.get_kv_cache_spec()
 
-        assert "layer.0" in kv_cache_spec
-        assert isinstance(kv_cache_spec["layer.0"], MLAAttentionSpec)
+        # Without compilation context, it will create specs for the main model layers
+        # as well as the draft model layer.
+        assert len(kv_cache_spec) > model_layers
+
+        assert "draft_layer.0" in kv_cache_spec
+        draft_spec = kv_cache_spec["draft_layer.0"]
+        assert isinstance(draft_spec, FullAttentionSpec)
+
+        for i in range(model_layers):
+            assert f"layer.{i}" in kv_cache_spec
+            spec = kv_cache_spec[f"layer.{i}"]
+            assert isinstance(spec, MLAAttentionSpec)
+            assert spec.num_kv_heads == 1

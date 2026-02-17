@@ -1,3 +1,17 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from dataclasses import field
 from types import SimpleNamespace
 from typing import Any, Tuple
@@ -12,6 +26,7 @@ from flax.typing import PRNGKey
 from jax.sharding import Mesh
 from vllm.config import ModelConfig
 
+from tpu_inference.layers.jax.quantization.unquantized import UnquantizedConfig
 from tpu_inference.models.jax.llama4 import (Llama4ForCausalLM,
                                              Llama4WeightLoader)
 
@@ -20,7 +35,7 @@ class MockParamLlama4:
     """A mock for a parameter used in the Llama4 model."""
     shape: Tuple[int, ...]
     dtype: jnp.dtype = jnp.bfloat16
-    sharding_spec: Tuple[str | None, ...] | None = None
+    sharding: Tuple[str | None, ...] | None = None
     value: Any = field(init=False)
     sharding: Any = field(init=False)
 
@@ -28,11 +43,11 @@ class MockParamLlama4:
         self.shape = shape
         self.value = jnp.zeros(self.shape, dtype=self.dtype)
         # The sharding spec is accessed during weight loading
-        self.sharding = SimpleNamespace(spec=self.sharding_spec)
+        self.sharding = SimpleNamespace(spec=self.sharding)
 
     # Allow the mock parameter's value to be updated
     def __setattr__(self, name, value):
-        if name in ['value', 'shape', 'dtype', 'sharding', 'sharding_spec']:
+        if name in ['value', 'shape', 'dtype', 'sharding', 'sharding_names']:
             self.__dict__[name] = value
         else:
             super().__setattr__(name, value)
@@ -76,6 +91,9 @@ class MockVllmConfig:
 
         self.model_config.hf_config = hf_config_mock
 
+        # TODO (jacobplatin): we shouldn't hardcode the quant config
+        self.quant_config = UnquantizedConfig({})
+
 
 @pytest.fixture(scope="module")
 def mesh():
@@ -107,12 +125,23 @@ def mock_vllm_config_llama4() -> MockVllmConfig:
     return MockVllmConfig(model_name="meta-llama/Llama-4-Scout-17B-16E")
 
 
+@pytest.fixture(autouse=True)
+def mock_get_pp_group():
+    with patch("tpu_inference.models.jax.llama4.get_pp_group",
+               return_value=MagicMock(is_first_rank=True,
+                                      is_last_rank=True,
+                                      rank_in_group=0,
+                                      world_size=1)):
+        yield
+
+
 class TestLlama4ForCausalLM:
     """Tests for the main LlamaForCausalLM model class."""
 
     def test_init_llama4(self, mock_vllm_config_llama4, rng, mesh):
         """Tests correct parameter detection for the Llama4 model variant."""
-        model = Llama4ForCausalLM(mock_vllm_config_llama4, rng, mesh)
+        with jax.set_mesh(mesh):
+            model = Llama4ForCausalLM(mock_vllm_config_llama4, rng, mesh)
         assert model.hidden_size == 32
         assert "llama-4" in model.vllm_config.model_config.model.lower()
 
@@ -139,16 +168,20 @@ class TestLlama4ForCausalLM:
 
             assert jnp.all(final_norm_scale == 1.0)
 
-    @patch("tpu_inference.models.jax.llama4.Llama4WeightLoader")
-    def test_load_weights_called_correctly(self, mock_loader_cls, rng, mesh):
+    def test_load_weights_called_correctly(self, rng, mesh):
         """Tests that the weight loader is called correctly for checkpoint loading."""
-        vllm_config = MockVllmConfig(model_name="llama4-scout",
-                                     random_weights=False)
-        model = Llama4ForCausalLM(vllm_config, rng, mesh)
+        with jax.set_mesh(mesh):
+            vllm_config = MockVllmConfig(model_name="llama4-scout",
+                                         random_weights=False)
+            model = Llama4ForCausalLM(vllm_config, rng, mesh)
 
-        mock_loader_instance = MagicMock()
-        mock_loader_cls.return_value = mock_loader_instance
-        model.load_weights(rng)
+        # Patch the WeightLoader attribute specifically on the class
+        with patch.object(Llama4ForCausalLM,
+                          'WeightLoader') as mock_loader_cls:
+            mock_loader_instance = MagicMock()
+            mock_loader_cls.return_value = mock_loader_instance
+
+            model.load_weights(rng)
 
         mock_loader_cls.assert_called_once_with(vllm_config=vllm_config,
                                                 hidden_size=32,
@@ -181,6 +214,20 @@ class TestLlama4WeightLoader:
         """Tests the private _get_layer_num utility function."""
         assert weight_loader._get_layer_num(hf_key) == expected_num
 
+    @pytest.mark.parametrize("hf_key, expected_num", [
+        ("language_model.model.layers.10.feed_forward.experts.4.down_proj.weight",
+         4),
+        ("language_model.model.layers.0.feed_forward.experts.0.gate_proj.weight_scale",
+         0),
+        ("language_model.model.layers.5.feed_forward.experts.128.up_proj.weight",
+         128),
+        ("language_model.model.norm.weight", None),
+        ("language_model.model.layers.15.self_attn.q_proj.weight", None),
+    ])
+    def test_get_expert_num(self, weight_loader, hf_key, expected_num):
+        """Tests the private _get_expert_num utility function to extract the expert index."""
+        assert weight_loader._get_expert_num(hf_key) == expected_num
+
     @pytest.mark.parametrize("hf_key, expected", [
         ("language_model.model.layers.15.self_attn.q_proj.weight",
          "layers.15.attn.kernel_q_proj_DNH"),
@@ -202,8 +249,8 @@ class TestLlama4WeightLoader:
         """Tests that weights are correctly reshaped, transposed, and loaded."""
         vllm_config = MockVllmConfig(model_name="llama4-small-test",
                                      random_weights=False)
-
-        model = Llama4ForCausalLM(vllm_config, rng, mesh)
+        with jax.set_mesh(mesh):
+            model = Llama4ForCausalLM(vllm_config, rng, mesh)
 
         # Original weight shape is (vocab_size, hidden_size)
         original_weight = jnp.ones((128, 32))
@@ -233,7 +280,8 @@ class TestLlama4WeightLoader:
     def test_map_llama4_gate_up_proj(self, weight_loader, rng, mesh):
         """Tests that gate_up_proj weights are correctly split, reshaped, transposed, and loaded."""
         # Set up a dummy model and its config
-        model = Llama4ForCausalLM(MockVllmConfig("test-model"), rng, mesh)
+        with jax.set_mesh(mesh):
+            model = Llama4ForCausalLM(MockVllmConfig("test-model"), rng, mesh)
 
         # Create a dummy fused gate_up_proj weight tensor
         hidden_size = 32

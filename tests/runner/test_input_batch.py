@@ -1,7 +1,23 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import numpy as np
 import pytest
-from vllm.sampling_params import SamplingParams
+import torch
 from vllm.pooling_params import PoolingParams
+from vllm.sampling_params import SamplingParams
+from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 
 from tpu_inference.runner.input_batch import CachedRequestState, InputBatch
 
@@ -235,6 +251,7 @@ def test_all_greedy_property(input_batch: InputBatch):
 
 
 
+
 def test_add_pooling_request(input_batch_for_pooling: InputBatch):
     pooling_params = PoolingParams(dimensions = 768, normalize = True, use_activation = True)
     req = create_dummy_request("req-1", prompt_len = 20, output_len = 4, pooling_params = pooling_params)
@@ -324,3 +341,71 @@ def test_remove_multiple_pooling_requests(input_batch_for_pooling: InputBatch):
     assert input_batch_for_pooling.req_ids == ["req-1"]
     pooling_values = input_batch_for_pooling.get_pooling_params()
     assert pooling_values == [pooling_params[1]]
+
+
+def test_get_pooling_metadata(input_batch: InputBatch):
+    """Tests the get_pooling_metadata interface"""
+
+    def states_eq(a: PoolingStates, b: PoolingStates):
+        checks = [
+            len(a.hidden_states_cache) == len(b.hidden_states_cache),
+            all(
+                torch.equal(x, y)
+                for x, y in zip(a.hidden_states_cache, b.hidden_states_cache)),
+        ]
+        return all(checks)
+
+    def meta_eq(a: PoolingMetadata, b: PoolingMetadata):
+        assert a.prompt_token_ids is None and b.prompt_token_ids is None
+        checks = [
+            torch.equal(a.prompt_lens, b.prompt_lens),
+            len(a.pooling_params) == len(b.pooling_params),
+            len(a.pooling_states) == len(b.pooling_states),
+            all(x == y for x, y in zip(a.pooling_params, b.pooling_params)),
+            all(
+                states_eq(x, y)
+                for x, y in zip(a.pooling_states, b.pooling_states)),
+            # ignore pooling cursor
+        ]
+        return all(checks)
+
+    assert meta_eq(
+        input_batch.get_pooling_metadata(),
+        PoolingMetadata(
+            prompt_lens=torch.tensor([], dtype=torch.int32),
+            prompt_token_ids=None,
+            pooling_params=[],
+            pooling_states=[],
+        ),
+    ), "Initial value should be all empty"
+
+    # Just some task value to pass assertion in PoolingMetadata.__post_init__
+    pooling_param = PoolingParams(task="embed")
+    pooling_state = PoolingStates()
+
+    req_0 = create_dummy_request(
+        "req-0",
+        prompt_len=10,
+        pooling_params=pooling_param,
+    )
+    input_batch.add_request(req_0)
+    assert meta_eq(
+        input_batch.get_pooling_metadata(),
+        PoolingMetadata(
+            prompt_lens=torch.tensor([10], dtype=torch.int32),
+            prompt_token_ids=None,
+            pooling_params=[pooling_param],
+            pooling_states=[pooling_state],
+        ),
+    ), "Pooling states is populated by InputBatch object it self"
+
+    input_batch.remove_request("req-0")
+    assert meta_eq(
+        input_batch.get_pooling_metadata(),
+        PoolingMetadata(
+            prompt_lens=torch.tensor([], dtype=torch.int32),
+            prompt_token_ids=None,
+            pooling_params=[],
+            pooling_states=[],
+        ),
+    ), "After remove, back to empty state."

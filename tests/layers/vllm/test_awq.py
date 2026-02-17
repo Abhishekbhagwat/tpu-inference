@@ -1,11 +1,25 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import tempfile
 from typing import Optional
+from unittest.mock import MagicMock, patch
 
 import jax
 import pytest
 import torch
 import torchax
-import utils as test_utils
 from jax.sharding import PartitionSpec
 from torchax.interop import torch_view
 from torchax.ops.mappings import j2t, t2j
@@ -23,10 +37,12 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import \
 from vllm.model_executor.model_loader import get_model as vllm_get_model
 from vllm.scalar_type import scalar_types
 
+from tests.layers.common import utils as test_utils
 from tpu_inference.layers.vllm.quantization import get_tpu_quantization_config
 from tpu_inference.layers.vllm.quantization.awq import (VllmAWQConfig,
                                                         VllmAWQLinearMethod)
-from tpu_inference.layers.vllm.quantization.common import JaxCommonLinearConfig
+from tpu_inference.layers.vllm.quantization.configs import \
+    VllmQuantLinearConfig
 
 P = PartitionSpec
 MODELS = ["Qwen/Qwen2.5-1.5B-Instruct-AWQ"]
@@ -88,8 +104,8 @@ def return_ref_and_layer_output(
     assert isinstance(quant_method, VllmAWQLinearMethod)
     quant_config = quant_method.quant_config
     assert isinstance(quant_config, VllmAWQConfig)
-    jax_config = quant_method.jax_config
-    assert isinstance(jax_config, JaxCommonLinearConfig)
+    jax_config = quant_method.linear_config
+    assert isinstance(jax_config, VllmQuantLinearConfig)
 
     input_tensor = torch.rand(
         batch_size, layer.input_size, dtype=torch.bfloat16) / 10
@@ -119,8 +135,8 @@ def initialize_and_return_layer_weights(layer: torch.nn.Module):
     assert isinstance(quant_method, VllmAWQLinearMethod)
     quant_config = quant_method.quant_config
     assert isinstance(quant_config, VllmAWQConfig)
-    jax_config = quant_method.jax_config
-    assert isinstance(jax_config, JaxCommonLinearConfig)
+    jax_config = quant_method.linear_config
+    assert isinstance(jax_config, VllmQuantLinearConfig)
 
     # torch.rand returns value in the range of [0, 1). We subtract by 0.2 to
     # simulate asymmetry
@@ -153,6 +169,16 @@ def initialize_and_return_layer_weights(layer: torch.nn.Module):
 
 
 @pytest.fixture(autouse=True)
+def mock_get_pp_group():
+    with patch("tpu_inference.distributed.jax_parallel_state.get_pp_group",
+               return_value=MagicMock(is_first_rank=True,
+                                      is_last_rank=True,
+                                      rank_in_group=0,
+                                      world_size=1)):
+        yield
+
+
+@pytest.fixture(autouse=True)
 def setup_environment():
     # This is a fake config used for init dist env.
     # RowParallelLinear needs dist env to be initialized.
@@ -161,6 +187,7 @@ def setup_environment():
         max_model_len=64,
         max_num_batched_tokens=64,
         max_num_seqs=4,
+        dtype='bfloat16',
     )
 
     vllm_config = engine_args.create_engine_config()
@@ -188,6 +215,7 @@ def test_quant_override(model, mesh):
         max_model_len=64,
         max_num_batched_tokens=64,
         max_num_seqs=4,
+        dtype='bfloat16',
     )
     vllm_config = engine_args.create_engine_config()
     vllm_config.model_config.dtype = torch.bfloat16
@@ -215,6 +243,7 @@ def test_loading_model(model, mesh):
         max_model_len=64,
         max_num_batched_tokens=64,
         max_num_seqs=4,
+        dtype='bfloat16',
     )
     vllm_config = engine_args.create_engine_config()
     vllm_config.model_config.dtype = torch.bfloat16
@@ -243,9 +272,10 @@ def test_row_parallel_linear(model, bias, mesh, enable_sp):
         max_model_len=64,
         max_num_batched_tokens=64,
         max_num_seqs=4,
+        dtype='bfloat16',
     )
     vllm_config = engine_args.create_engine_config()
-    vllm_config.compilation_config.pass_config.enable_sequence_parallelism = enable_sp
+    vllm_config.compilation_config.pass_config.enable_sp = enable_sp
 
     vllm_config.model_config.dtype = dtype
     quant_config = get_tpu_quantization_config(vllm_config, mesh)
@@ -281,9 +311,10 @@ def test_column_parallel_linear(model, bias, mesh, enable_sp):
         max_model_len=64,
         max_num_batched_tokens=64,
         max_num_seqs=4,
+        dtype='bfloat16',
     )
     vllm_config = engine_args.create_engine_config()
-    vllm_config.compilation_config.pass_config.enable_sequence_parallelism = enable_sp
+    vllm_config.compilation_config.pass_config.enable_sp = enable_sp
 
     # Call tpu_inference code
     vllm_config.model_config.dtype = torch.bfloat16
@@ -321,9 +352,10 @@ def test_qkv_parallel_linear(model, bias, mesh, enable_sp, fuse_matmuls):
         max_model_len=64,
         max_num_batched_tokens=64,
         max_num_seqs=4,
+        dtype='bfloat16',
     )
     vllm_config = engine_args.create_engine_config()
-    vllm_config.compilation_config.pass_config.enable_sequence_parallelism = enable_sp
+    vllm_config.compilation_config.pass_config.enable_sp = enable_sp
 
     # Call tpu_inference code
     vllm_config.model_config.dtype = torch.bfloat16
@@ -365,9 +397,10 @@ def test_merged_column_parallel_linear(model, bias, mesh, fuse_matmuls,
         max_model_len=64,
         max_num_batched_tokens=64,
         max_num_seqs=4,
+        dtype='bfloat16',
     )
     vllm_config = engine_args.create_engine_config()
-    vllm_config.compilation_config.pass_config.enable_sequence_parallelism = enable_sp
+    vllm_config.compilation_config.pass_config.enable_sp = enable_sp
 
     # Call tpu_inference code
     vllm_config.model_config.dtype = torch.bfloat16

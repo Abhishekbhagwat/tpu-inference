@@ -26,7 +26,14 @@ There are three ways to install `tpu-inference`:
 
 3. Use the following command to install vllm-tpu using `pip`
 
+    !!! note
+        Until jax=0.8.3 is released, v7x will have different build requirements from previous TPU generations (v6e and prior). As a result, please use the following until consolidation is complete.
+
     ```shell
+    # v6e and prior
+    pip install vllm-tpu --version=0.13.2.post6
+
+    # v7x
     pip install vllm-tpu
     ```
 
@@ -56,8 +63,8 @@ For debugging or development purposes, you can install `tpu-inference` from sour
 1. Clone the `vllm` and `tpu-inference` repositories:
 
     ```shell
-    git clone https://github.com/vllm-project/vllm.git
-    git clone https://github.com/vllm-project/tpu-inference.git
+    git clone https://github.com/vllm-project/tpu-inference.git; export VLLM_COMMIT_HASH="$(cat tpu-inference/.buildkite/vllm_lkg.version)"
+    git clone https://github.com/vllm-project/vllm.git; cd vllm && git checkout "${VLLM_COMMIT_HASH}"
     ```
 
 1. Set up a Python virtual environment:
@@ -68,6 +75,9 @@ For debugging or development purposes, you can install `tpu-inference` from sour
     ```
 
 1. Install `vllm` from source, targeting the TPU device:
+
+    NOTE: `tpu-inference` repo pins `vllm` revision in `vllm_lkg.version` file,
+    make sure to checkout proper revision beforehand.
 
     ```shell
     cd vllm

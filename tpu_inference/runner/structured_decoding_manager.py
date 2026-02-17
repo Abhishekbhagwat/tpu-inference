@@ -1,3 +1,17 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import functools
 from typing import TYPE_CHECKING, Tuple
 
@@ -61,11 +75,10 @@ class StructuredDecodingManager:
         self.runner.require_structured_out_cpu.fill(0)
 
         sorted_struct_requests = sorted(
-            grammar_output.structured_output_request_ids.items(),
-            key=lambda item: item[1])
+            grammar_output.structured_output_request_ids)
 
         cumulative_mask_idx = 0
-        for req_id, _ in sorted_struct_requests:
+        for req_id in sorted_struct_requests:
             if req_id not in self.runner.input_batch.req_id_to_index:
                 continue
             batch_index = self.runner.input_batch.req_id_to_index[req_id]

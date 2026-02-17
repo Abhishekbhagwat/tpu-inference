@@ -1,3 +1,17 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # TODO: Update documentation
 
 from typing import List, Optional, Tuple
@@ -67,10 +81,10 @@ class LlamaForCausalLM(nnx.Module):
                                  random_init=force_random_weights,
                                  vd_sharding=("model", None))
 
-        self.layers = []
+        layers = []
         kv_cache_dtype = self.vllm_config.cache_config.cache_dtype
         for _ in range(num_layers):
-            self.layers.append(
+            layers.append(
                 TransformerBlock(
                     pre_attention_norm=RMSNorm(
                         dims=self.hidden_size,
@@ -115,8 +129,10 @@ class LlamaForCausalLM(nnx.Module):
                                            rngs=self.rng,
                                            df_sharding=(None, "model"),
                                            fd_sharding=("model", None),
-                                           random_init=force_random_weights),
+                                           random_init=force_random_weights,
+                                           mesh=self.mesh),
                 ))
+        self.layers = nnx.List(layers)
 
         self.final_norm = RMSNorm(
             dims=self.hidden_size,

@@ -1,3 +1,17 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from unittest.mock import MagicMock, patch
 
 import jax
@@ -97,13 +111,13 @@ class TestEagleLlama3ForCausalLM:
         hf_config = mock_vllm_config.speculative_config.draft_model_config.hf_config
         dtype = jnp.bfloat16
         rngs = nnx.Rngs(rng)
-
-        layer = Eagle3LlamaDecoderLayer(
-            hf_config,
-            dtype,
-            rngs,
-            mesh,
-            kv_cache_dtype=mock_vllm_config.cache_config.cache_dtype)
+        with jax.set_mesh(mesh):
+            layer = Eagle3LlamaDecoderLayer(
+                hf_config,
+                dtype,
+                rngs,
+                mesh,
+                kv_cache_dtype=mock_vllm_config.cache_config.cache_dtype)
 
         # Check if projection layers are overridden with correct input size
         original_hidden_size = hf_config.hidden_size
@@ -126,9 +140,11 @@ class TestEagleLlama3ForCausalLM:
     def test_forward_pass(self, mock_vllm_config: MockVllmConfig, rng: PRNGKey,
                           mesh: Mesh, mock_model_inputs):
         """Tests the forward pass of the EagleLlama3ForCausalLM model."""
+
         draft_model_config = mock_vllm_config.speculative_config.draft_model_config
         hf_config = draft_model_config.hf_config
-        model = EagleLlama3ForCausalLM(mock_vllm_config, rng, mesh)
+        with jax.set_mesh(mesh):
+            model = EagleLlama3ForCausalLM(mock_vllm_config, rng, mesh)
 
         input_ids, hidden_states, attention_metadata = mock_model_inputs
 
@@ -162,7 +178,8 @@ class TestEagleLlama3ForCausalLM:
                           mock_vllm_config: MockVllmConfig, rng: PRNGKey,
                           mesh: Mesh):
         """Tests that the load_weights function is called correctly."""
-        model = EagleLlama3ForCausalLM(mock_vllm_config, rng, mesh)
+        with jax.set_mesh(mesh):
+            model = EagleLlama3ForCausalLM(mock_vllm_config, rng, mesh)
         model.load_weights(rng)
 
         mock_load_hf_weights.assert_called_once()

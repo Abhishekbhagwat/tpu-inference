@@ -1,3 +1,17 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import unittest
 
 import jax
@@ -54,14 +68,13 @@ class TestLayers(unittest.TestCase):
             hidden_size = 512
             intermediate_size = 2048
 
-            ffw_layer = DenseFFW(
-                random_init=True,
-                dtype=jnp.bfloat16,
-                hidden_act="silu",
-                hidden_size=hidden_size,
-                intermediate_size=intermediate_size,
-                rngs=nnx.Rngs(0),
-            )
+            ffw_layer = DenseFFW(random_init=True,
+                                 dtype=jnp.bfloat16,
+                                 hidden_act="silu",
+                                 hidden_size=hidden_size,
+                                 intermediate_size=intermediate_size,
+                                 rngs=nnx.Rngs(0),
+                                 mesh=self.mesh)
 
             seq_len = 128
             x = jnp.ones((seq_len, hidden_size), dtype=jnp.bfloat16)

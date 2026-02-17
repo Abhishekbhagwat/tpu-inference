@@ -5,7 +5,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.multimodal.cache import worker_receiver_cache_from_config
 from vllm.utils.network_utils import (get_distributed_init_method, get_ip,
                                       get_open_port)
 from vllm.v1.executor.abstract import Executor
@@ -21,8 +20,7 @@ class DisaggExecutor(Executor):
     def _init_executor(self) -> None:
         """Initialize the worker and load the model.
         """
-        self.driver_worker = WorkerWrapperBase(vllm_config=self.vllm_config,
-                                               rpc_rank=0)
+        self.driver_worker = WorkerWrapperBase(rpc_rank=0)
         slice_config = getattr(self.vllm_config.device_config, "slice")
         idx = slice_config[0]
         jax_devices = slice_config[-1]
@@ -81,8 +79,8 @@ class DisaggExecutor(Executor):
             is_driver_worker=is_driver_worker,
             devices=devices,
         )
-        self.mm_receiver_cache = worker_receiver_cache_from_config(
-            self.vllm_config, MULTIMODAL_REGISTRY, Lock())
+        self.mm_receiver_cache = MULTIMODAL_REGISTRY.worker_receiver_cache_from_config(
+            self.vllm_config, Lock())
         self.collective_rpc("init_worker", args=([kwargs], ))
         self.collective_rpc("init_device")
         self.collective_rpc("load_model")

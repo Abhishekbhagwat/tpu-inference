@@ -1,4 +1,18 @@
-from unittest.mock import MagicMock
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from unittest.mock import MagicMock, patch
 
 import jax
 import jax.numpy as jnp
@@ -74,6 +88,19 @@ def rng() -> PRNGKey:
     return jax.random.PRNGKey(42)
 
 
+@pytest.fixture(autouse=True)
+def mock_get_pp_group():
+    mock_pp = MagicMock(is_first_rank=True,
+                        is_last_rank=True,
+                        rank_in_group=0,
+                        world_size=1)
+    with patch("tpu_inference.models.jax.llama3.get_pp_group",
+               return_value=mock_pp), patch(
+                   "tpu_inference.layers.jax.pp_utils.get_pp_group",
+                   return_value=mock_pp):
+        yield
+
+
 class TestLlamaForCausalLM:
     """Tests for the main LlamaForCausalLM model class."""
 
@@ -85,7 +112,8 @@ class TestLlamaForCausalLM:
         """Tests model init and model forward for the 8B model variant."""
 
         # Test model init
-        model = LlamaForCausalLM(mock_vllm_config, rng, mesh)
+        with jax.set_mesh(mesh):
+            model = LlamaForCausalLM(mock_vllm_config, rng, mesh)
 
         model_config = mock_vllm_config.model_config
         hf_config = model_config.hf_config
@@ -100,7 +128,7 @@ class TestLlamaForCausalLM:
         layers = model.model.layers
         assert len(layers) == hf_config.num_hidden_layers
         assert isinstance(model.rng, nnx.Rngs)
-        assert model.model.lm_head == model.model.embed.embedding
+        assert (model.model.lm_head == model.model.embed.embedding).all()
 
         attn = layers[0].self_attn
         hidden_size = hf_config.hidden_size
@@ -145,7 +173,8 @@ class TestLlamaForCausalLM:
         # 1 seq with 16 tokens
         input_ids, attention_metadata, indices_do_sample = mock_model_inputs
         kv_caches, hidden_states, aux_hidden_states = model(
-            kv_caches, input_ids, attention_metadata)
+            kv_caches, input_ids, attention_metadata, None, None, None, None,
+            None, True, True)
         assert hidden_states.shape == (8, hidden_size)
         assert len(aux_hidden_states) == 0
 

@@ -1,3 +1,17 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import random
 from typing import Optional
 
@@ -18,20 +32,22 @@ from vllm.lora.layers import (BaseLayerWithLoRA, ColumnParallelLinearWithLoRA,
                               ReplicatedLinearWithLoRA,
                               RowParallelLinearWithLoRA)
 # yapf: enable
-from vllm.lora.models import LoRALayerWeights, PackedLoRALayerWeights
+from vllm.lora.lora_weights import LoRALayerWeights, PackedLoRALayerWeights
 from vllm.lora.punica_wrapper import get_punica_wrapper
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                MergedColumnParallelLinear,
                                                QKVParallelLinear,
                                                ReplicatedLinear,
                                                RowParallelLinear)
-from vllm.model_executor.utils import set_random_seed
 from vllm.platforms import current_platform
+from vllm.utils.torch_utils import set_random_seed
 
-from tpu_inference.layers.vllm.quantization.common import JaxCommonLinearConfig
+from tpu_inference.layers.vllm.process_weights.cleanup_sharding import \
+    _shard_module_to_tpu
+from tpu_inference.layers.vllm.quantization.configs import \
+    VllmQuantLinearConfig
 from tpu_inference.layers.vllm.quantization.unquantized import \
     VllmUnquantizedLinearMethod
-from tpu_inference.layers.vllm.sharding import _shard_module_to_tpu
 
 from .utils import DummyLoRAManager
 
@@ -91,7 +107,6 @@ def populate_loras(
     index_to_id: list[Optional[int]],
     lora_layer: BaseLayerWithLoRA,
     baselayer_weights: torch.Tensor,
-    generate_embeddings_tensor: int = 0,
     repeats: int = 1,
 ) -> tuple[dict[int, LoRALayerWeights], dict[int, list[LoRALayerWeights]]]:
     """This method populates the lora weights (lora_a and lora_b) in the lora layers (BaseLayerWithLoRA).
@@ -103,8 +118,6 @@ def populate_loras(
         lora_layer: the LoRAlayer to populate.
         baselayer_weights: the PyTorch tensor containing the layer's
             weights.
-        generate_embeddings_tensor: whether to generate an
-            embeddings tensor for each LoRA.
         repeats: must only be set for column parallel packed
             layers. Indicates the number of loras to compose
             together to create a single lora layer.
@@ -131,7 +144,6 @@ def populate_loras(
                     baselayer_weights.device).init_random_lora(
                         module_name=f"fake_{i}",
                         weight=baselayer_weights,
-                        generate_embeddings_tensor=generate_embeddings_tensor,
                     )
                 sublora.lora_b = sublora.lora_b[(sublora_len *
                                                  i):(sublora_len * (i + 1)), :]
@@ -147,7 +159,6 @@ def populate_loras(
                     slot_idx,
                     lora_a=lora.lora_a,
                     lora_b=lora.lora_b,
-                    embeddings_tensor=lora.embeddings_tensor,
                 )
 
             lora_dict[lora_id] = lora
@@ -504,9 +515,13 @@ def _create_random_linear_parallel_layer(layer_type, vllm_config, mesh):
     return linear, lora_linear
 
 
+def _get_devices():
+    return jax.devices()
+
+
 def _create_mesh():
     axis_names = ("data", "model")
-    devices = jax.devices()
+    devices = _get_devices()
     mesh_shape = (1, len(devices))
     mesh = jax.make_mesh(mesh_shape, axis_names, devices=devices)
     return mesh
@@ -518,7 +533,7 @@ def _verify_lora_linear_layer(linear, lora_linear):
         # BaseLinearLayerWithLoRA.weight property guarantees this.
         # if len(devices) != 1, `reorder_concatenated_tensor_for_sharding` function may reorder the out_features dimension of the weight matrix.
         # So the below check will fail.
-        if len(jax.devices()) == 1:
+        if len(_get_devices()) == 1:
             assert torch.equal(linear.weight.data,
                                lora_linear.weight.to('cpu'))
 
@@ -546,7 +561,6 @@ def _update_punica_wrapper_metadata(punica_wrapper, index_mapping,
             index_to_id,
             lora_config.max_loras,
             vocab_size=512,
-            extra_vocab_size=lora_config.lora_extra_vocab_size,
         )
         assert jax_view(punica_wrapper._lora_indices_per_batch).platform(
         ) == 'tpu', 'punica_wrapper._lora_indices_per_batch should have been moved to TPU.'
@@ -616,8 +630,8 @@ def _create_lora_wrapper(linear,
                          vllm_config,
                          mesh,
                          repeats=1):
-    base_linear.weight.data = linear.weight.data
-    jax_config = JaxCommonLinearConfig(vllm_config, mesh, base_linear)
+    base_linear.weight.data = linear.weight.data.clone()
+    jax_config = VllmQuantLinearConfig(vllm_config, mesh, base_linear)
     linear_method = VllmUnquantizedLinearMethod(jax_config)
     base_linear.quant_method = linear_method
     linear_method.process_weights_after_loading(

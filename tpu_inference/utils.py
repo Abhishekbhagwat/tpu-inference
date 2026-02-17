@@ -1,40 +1,67 @@
 # SPDX-License-Identifier: Apache-2.0
-import os
 import time
 from collections import defaultdict
 from collections.abc import Sequence
 from functools import wraps
-from typing import Any, Callable, List, Tuple
+from typing import Any, Callable, List, Tuple, Union
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+import torch
 from jax._src import dtypes
 from jax._src import mesh as mesh_lib
 from jax._src import xla_bridge as xb
 from jax._src.lib import xla_client as xc
+from jax._src.numpy.scalar_types import _ScalarMeta
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
-from vllm import envs, utils
+from torchax.ops.mappings import j2t_dtype, t2j_dtype
+from vllm import envs as vllm_envs
+from vllm import utils
 
+from tpu_inference import envs
 from tpu_inference.logger import init_logger
 
 GBYTES = 1024 * 1024 * 1024
 TPU_HEAD_SIZE_ALIGNMENT = 128
 TPU_SECOND_LAST_MINOR = 8
 
-# This is used to translate from a string name for a dtype
-# to formal jax.numpy DType.  One use case for this is
-# converting the `--kv_cache_dtype` flag to a dtype.
-TPU_STR_DTYPE_TO_JAX_DTYPE = {
-    "bfloat16": jnp.bfloat16,
-    "fp8": jnp.float8_e4m3fn,
-    "fp8_e4m3": jnp.float8_e4m3,
-    "fp8_e5m2": jnp.float8_e5m2,
-    "int8": jnp.int8,
+# Map vllm dtype string that doesn't exactly match jax dtype string name.
+_VLLM_DTYPE_STR_TO_JAX_DTYPE = {
+    "fp8": jnp.float8_e4m3fn.dtype,
+    "fp8_e4m3": jnp.float8_e4m3fn.dtype,
+    "fp8_e5m2": jnp.float8_e5m2.dtype,
 }
+
+
+def to_jax_dtype(dtype: str | jnp.dtype | torch.dtype) -> jnp.dtype:
+    if isinstance(dtype, str):
+        if dict_dtype := _VLLM_DTYPE_STR_TO_JAX_DTYPE.get(dtype, None):
+            return dict_dtype
+        return jnp.dtype(dtype)
+    elif isinstance(dtype, torch.dtype):
+        return t2j_dtype(dtype)
+    elif isinstance(dtype, jnp.dtype):
+        return dtype
+    elif isinstance(dtype, _ScalarMeta):
+        return dtype.dtype
+    else:
+        raise ValueError(f"Argument is unsupported data type {type(dtype)}")
+
+
+def to_torch_dtype(dtype: str | jnp.dtype | torch.dtype) -> torch.dtype:
+    # Use jax dtype as an intermediate dtype which we'll be used to convert it
+    # into torch dtype.
+    dtype = to_jax_dtype(dtype)
+    return j2t_dtype(dtype)
+
 
 _megacore = False
 logger = init_logger(__name__)
+
+
+def align_to(unpadded_dim, pad_multiple):
+    return (unpadded_dim + pad_multiple - 1) // pad_multiple * pad_multiple
 
 
 def enable_megacore() -> None:
@@ -57,10 +84,10 @@ def get_num_kv_heads_by_tp(num_kv_heads: int, tp_size: int) -> int:
 
 def hbm_usage_bytes(devices: Any) -> List[Tuple[int, int]]:
     usage = []
-    if envs.VLLM_TPU_USING_PATHWAYS:
+    if vllm_envs.VLLM_TPU_USING_PATHWAYS:
         return pathways_hbm_usage_gb(devices)
 
-    multihost_backend = os.environ.get("TPU_MULTIHOST_BACKEND", "").lower()
+    multihost_backend = envs.TPU_MULTIHOST_BACKEND
     if multihost_backend == "ray":
         # MemoryStats is only supported for addressable PjRt devices.
         # Assume all the devices have similar memory usage for now.
@@ -131,9 +158,18 @@ def pathways_hbm_usage_gb(devices: Any) -> List[Tuple[float, float]]:
     live_arrays = jax.live_arrays()
     hbm_used = defaultdict(int)
     hbm_limit = get_device_hbm_limit()
+
+    # Track unique buffers to avoid double-counting when multiple Python
+    # variables reference the same underlying JAX array (e.g., a = jnp.ones(10); b = a)
+    seen_buffers = set()
+
     for array in live_arrays:
         for buffer in array.addressable_shards:
-            hbm_used[buffer.data.device] += buffer.data.nbytes
+            buffer_id = id(buffer.data)
+            if buffer_id not in seen_buffers:
+                seen_buffers.add(buffer_id)
+                hbm_used[buffer.data.device] += buffer.data.nbytes
+
     return [(hbm_used[device], hbm_limit) for device in devices]
 
 
@@ -163,7 +199,8 @@ def get_padded_num_heads(num_heads: int, sharding_size: int) -> int:
 
 
 def get_dtype_packing(dtype):
-    bits = dtypes.bit_width(dtype)
+    bits = (dtypes.bit_width(dtype)
+            if hasattr(dtypes, "bit_width") else dtypes.itemsize_bits(dtype))
     return 32 // bits
 
 
@@ -248,40 +285,11 @@ def device_array(mesh: Mesh, *args, sharding=None, **kwargs) -> jax.Array:
 
 def get_hash_fn_by_name(hash_fn_name: str) -> Callable[[Any], bytes]:
     """
-    A wrapper function of vllm.utils.get_hash_fn_by_name to support builtin
+    A wrapper function of vllm.utils.hashing.get_hash_fn_by_name to support builtin
     """
     if hash_fn_name == "builtin":
         return hash
-    return utils.get_hash_fn_by_name(hash_fn_name)
-
-
-def quantize_kv(key: jax.Array, value: jax.Array,
-                kv_cache_quantized_dtype: jnp.dtype, k_scale: float,
-                v_scale: float) -> Tuple[jax.Array, jax.Array]:
-    """
-        Quantize the key and value tensors.
-
-        Args:
-            key: The key tensor to quantize.
-            value: The value tensor to quantize.
-            kv_cache_quantized_dtype: The dtype to quantize the key and value tensors to.
-            q_scale: The scale to quantize the key and value tensors by.
-            k_scale: The scale to quantize the key tensor by.
-            v_scale: The scale to quantize the value tensor by.
-
-        Returns:
-            Tuple[jax.Array, jax.Array]: The quantized key and value tensors.
-        """
-    dtype_info = jnp.finfo(kv_cache_quantized_dtype)
-    minval, maxval = float(dtype_info.min), float(dtype_info.max)
-    key = key.astype(jnp.float32) / k_scale
-    key = jnp.clip(key, minval, maxval)
-    key = key.astype(kv_cache_quantized_dtype)
-    value = value.astype(jnp.float32) / v_scale
-    value = jnp.clip(value, minval, maxval)
-    value = value.astype(kv_cache_quantized_dtype)
-
-    return key, value
+    return utils.hashing.get_hash_fn_by_name(hash_fn_name)
 
 
 def get_jax_dtype_from_str_dtype(str_dtype: str) -> jnp.dtype:
@@ -294,8 +302,38 @@ def get_jax_dtype_from_str_dtype(str_dtype: str) -> jnp.dtype:
     Returns:
         jnp.dtype: The JAX dtype.
     """
-    str_dtype = str_dtype.lower().strip()
-    return TPU_STR_DTYPE_TO_JAX_DTYPE.get(str_dtype)
+    # TODO(kyuyeunk): Replace all reference of this function into TpuDtype.
+    return to_jax_dtype(str_dtype)
+
+
+def get_mesh_shape_product(
+    mesh: Mesh,
+    axes: Union[str, list[str], None],
+) -> int:
+    """
+    Get the product of mesh dimensions for one or more axes.
+
+    Examples:
+        # Single axis (defaults to 1 if not present)
+        get_mesh_shape_product(mesh, "model")
+
+        # Multiple axes - computes product of their sizes
+        get_mesh_shape_product(mesh, ["model", "attn_dp"])
+
+        # None means no sharding on this dimension
+        get_mesh_shape_product(mesh, None)  # returns 1
+    """
+    if axes is None:
+        return 1
+
+    if isinstance(axes, str):
+        axes = [axes]
+
+    product = 1
+    for axis in axes:
+        product *= mesh.shape.get(axis, 1)
+
+    return product
 
 
 def time_function(func):

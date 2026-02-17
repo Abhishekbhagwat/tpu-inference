@@ -60,7 +60,6 @@ D workflow:
 
 import copy
 import functools
-import os
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -86,9 +85,10 @@ if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.request import Request
 
+from tpu_inference import envs
 from tpu_inference.distributed.utils import (get_host_ip, get_kv_ips,
                                              get_kv_ports,
-                                             get_kv_transfer_port, get_node_id,
+                                             get_kv_transfer_port,
                                              get_side_channel_port)
 from tpu_inference.logger import init_logger
 from tpu_inference.runner.tpu_runner import TPUModelRunner
@@ -149,6 +149,7 @@ class TPUConnector(KVConnectorBase_V1):
 
     def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole):
         assert vllm_config.kv_transfer_config is not None
+        self._connector_metadata = None
 
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler = \
@@ -441,24 +442,28 @@ class TPUConnectorWorker:
 
         self.runner: TPUModelRunner = None
         self.mesh: Mesh = None
-        self.multi_host = os.getenv("TPU_MULTIHOST_BACKEND",
-                                    "").lower() == "ray"
-        # NOTE(xiang): This can not be the worker rank set in RayDistributedExecutor.
-        # The worker rank is assigned with vLLM's sorting logic, which does not work
-        # for TPU host topology.
-        self.node_id = get_node_id()
+        self.multi_host = envs.TPU_MULTIHOST_BACKEND == "ray"
+        # default value for none distributed scenario
+        # when the topology is initialized, runner will update it
+        # based on topology_order_id
+        self.node_id = 0
 
         # req_id: (kv, expiration_time)
         self.reqs_wait_pull: dict[ReqId, list[list[jax.Array], float]] = {}
         # req_id: thread_future
         self.reqs_pulling: dict[ReqId, Future] = {}
+        # the KV cache strafer uuid to request mapping
+        # the reason is vllm add prefix + external uuid suffix for each request id
+        # for example: prefill req_id:cmpl-cd70b21e-0f2b-46ed-910c-9525f706389a-0-99ae74c8
+        # decode req_id:cmpl-cd70b21e-0f2b-46ed-910c-9525f706389a-0-23cb9419
+        # this map will use the uuid to query the original request id
+        self.kv_pull_uuid_to_req_id_map: dict[int, ReqId] = {}
 
         self.host_ip = get_host_ip()
         self.kv_transfer_port = get_kv_transfer_port()
         self.side_channel_port = get_side_channel_port()
 
         self.kv_transfer_server = None
-        self._maybe_start_p2p_server()
         self.zmq_cxt = zmq.Context()
         if self.is_producer:
             ready_event = threading.Event()
@@ -474,7 +479,7 @@ class TPUConnectorWorker:
             self.pull_conns: dict[str, Any] = {}
             self.notif_sockets: dict[str, zmq.Socket] = {}
 
-        logger.info(f"TPUConnector Worker {self.node_id} --> init | "
+        logger.info(f"TPUConnector Worker --> init | "
                     f"ip={self.host_ip} | "
                     f"kv_transfer_port={self.kv_transfer_port} | "
                     f"side_channel_port={self.side_channel_port}")
@@ -490,6 +495,7 @@ class TPUConnectorWorker:
             self.zmq_cxt.destroy(linger=0)
 
     def register_runner(self, runner: TPUModelRunner):
+        self.node_id = runner.topology_order_id
         self.runner = runner
         self.mesh = runner.mesh
 
@@ -500,6 +506,11 @@ class TPUConnectorWorker:
         self.shape = list(kv_layer.shape)
         self.dtype = kv_layer.dtype
         self.sharding = kv_layer.sharding
+        logger.info(f"TPUConnector Worker --> register_runner | "
+                    f"node_id={self.node_id} | "
+                    f"ip={self.host_ip} | "
+                    f"kv_transfer_port={self.kv_transfer_port}")
+        self._maybe_start_p2p_server()
 
     def _maybe_start_p2p_server(self):
         if self.kv_transfer_server is not None:
@@ -515,7 +526,7 @@ class TPUConnectorWorker:
             use_raw_buffers=False,
         )
         logger.info(
-            f"TPUConnector Worker {self.node_id} --> kv transfer | addr={self.kv_transfer_server.address()}"
+            f"TPUConnector Worker {self.node_id} --> KV start_transfer_server | addr={self.kv_transfer_server.address()}"
         )
 
     def _pull_notify_listener(self, ready_event: threading.Event):
@@ -530,17 +541,24 @@ class TPUConnectorWorker:
         )
 
         while True:
-            client_id, req_id_bytes = sock.recv_multipart()
-            req_id = req_id_bytes.decode('utf-8')
-            logger.info(
-                f"TPUConnector Worker {self.node_id} --> zmq recieve | req_id={req_id}"
-            )
-            if req_id in self.reqs_wait_pull:
-                # Set the expiration time of this request to -1, mark to be done
-                self.reqs_wait_pull[req_id][1] = -1
+            client_id, uuid_bytes = sock.recv_multipart()
+            uuid = int(uuid_bytes.decode('utf-8'))
+            if uuid in self.kv_pull_uuid_to_req_id_map:
+                req_id = self.kv_pull_uuid_to_req_id_map[uuid]
+                logger.info(
+                    f"TPUConnector Worker {self.node_id} --> zmq recieve | req_id={req_id} | uuid={uuid}"
+                )
+                if req_id in self.reqs_wait_pull:
+                    # Set the expiration time of this request to -1, mark to be done
+                    self.reqs_wait_pull[req_id][1] = -1
+                    self.kv_pull_uuid_to_req_id_map.pop(uuid)
+                else:
+                    logger.warning(
+                        f"TPUConnector Worker {self.node_id} --> Disagg producer recives a non-exist pulling finished notification request {req_id} | uuid {uuid}"
+                    )
             else:
-                raise ValueError(
-                    f"Disagg producer recives a non-exist pulling finished notification request {req_id}"
+                logger.warning(
+                    f"TPUConnector Worker {self.node_id} --> Disagg producer recives a non-exist pulling finished notification uuid {uuid}"
                 )
             time.sleep(0)
             # The response is not really needed.
@@ -570,12 +588,12 @@ class TPUConnectorWorker:
                 # the data asyncly.
                 conn = self._maybe_build_kv_connection(req_meta)
                 self.reqs_pulling[req_id] = self.pull_executor.submit(
-                    self._pull_kv, conn, req_meta)
+                    self._pull_kv, req_id, conn, req_meta)
             else:
                 # The request has finished pulling the KV from remote, or it has full local
                 # prefix cache, need to notify P to let it free blocks.
                 socket = self._maybe_build_notif_socket(req_meta)
-                self._notify_pull_done(socket, req_id)
+                self._notify_pull_done(socket, req_id, req_meta.uuid)
 
     def _prepare_kv_and_wait(self, req_id: str, req_meta: SendMeta):
         local_block_ids = req_meta.local_block_ids
@@ -588,6 +606,7 @@ class TPUConnectorWorker:
         # So we have to set use_raw_buffers=False and stores the kv, then the kv buffer
         # will be safely destroyed by either D notifying or expiration.
         self.reqs_wait_pull[req_id] = [kv, req_meta.expiration_time]
+        self.kv_pull_uuid_to_req_id_map[req_meta.uuid] = req_id
         self.kv_transfer_server.await_pull(req_meta.uuid, kv)
 
     def _maybe_build_kv_connection(self, req_meta: LoadMeta) -> Any:
@@ -607,7 +626,7 @@ class TPUConnectorWorker:
             )
         return conn
 
-    def _pull_kv(self, conn: Any, req_meta: LoadMeta):
+    def _pull_kv(self, req_id: str, conn: Any, req_meta: LoadMeta):
         # The local allocated blocks which don't hit prefix caching.
         local_block_ids = req_meta.local_block_ids
         # The remote computed blocks which need to pull from P.
@@ -619,9 +638,15 @@ class TPUConnectorWorker:
         kv_spec = self._get_kv_spec(len(remote_block_ids))
         # TODO(xiang): pad block_ids to avoid recompilation
         indices = device_array(self.mesh, np.array(local_block_ids))
-        kv = conn.pull(req_meta.uuid, kv_spec)
         logger.info(
-            f"Worker {self.node_id} --> kv transfer | pull uuid={req_meta.uuid}"
+            f"Worker {self.node_id} --> kv transfer | start pull req_id={req_id} | uuid={req_meta.uuid}"
+        )
+        start_time = time.perf_counter()
+        kv = conn.pull(req_meta.uuid, kv_spec)
+        end_time = time.perf_counter()
+        kv_size_mb = sum(k.nbytes for k in kv) / (1024 * 1024)
+        logger.info(
+            f"Worker {self.node_id} --> kv transfer | done pull req_id={req_id} | uuid={req_meta.uuid} | duration={(end_time - start_time) * 1000:.2f}ms | size={kv_size_mb:.2f}MB"
         )
         return kv, indices
 
@@ -647,13 +672,15 @@ class TPUConnectorWorker:
                                    socket_type=zmq.DEALER,
                                    bind=False)
             logger.info(
-                f"Worker {self.node_id} --> zmq notify | sock_path={sock_path}"
+                f"Worker {self.node_id} --> notify make_zmq_socket | sock_path={sock_path}"
             )
         return sock
 
-    def _notify_pull_done(self, sock: zmq.Socket, req_id: str):
-        logger.info(f"Worker {self.node_id} --> zmq notify | req_id={req_id}")
-        sock.send_string(req_id)
+    def _notify_pull_done(self, sock: zmq.Socket, req_id: str, uuid: int):
+        logger.info(
+            f"Worker {self.node_id} --> zmq notify | req_id={req_id} | uuid={uuid}"
+        )
+        sock.send_string(str(uuid))
         # The response is not really needed.
         # ack = sock.recv_string()
 
@@ -695,9 +722,9 @@ class TPUConnectorWorker:
 
 def get_uuid() -> int:
     int128 = uuid4().int
-    # Must be 64-bit int, otherwise vllm output encoder would raise error.
-    int64 = int128 >> 64
-    return int64
+    # Must be less than 64-bit int, otherwise vllm output encoder would raise error.
+    # use 50 bit to avoid GO trunk the int when doing JSon serialization
+    return int128 >> 78
 
 
 @jax.jit

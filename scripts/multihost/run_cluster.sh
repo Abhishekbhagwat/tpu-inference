@@ -1,4 +1,18 @@
 #!/bin/bash
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 #
 # Launch a Ray cluster inside Docker for uLLM inference.
 #
@@ -67,6 +81,7 @@ fi
 # Set up Docker authentication for Google Container Registry.
 # Modify the hostname to accomodate your specific docker region.
 gcloud auth configure-docker us-east5-docker.pkg.dev
+gcloud auth configure-docker us-central1-docker.pkg.dev
 
 CONTAINER_NAME="node"
 
@@ -93,6 +108,21 @@ fi
 # --network host: Allows Ray nodes to communicate directly via host networking
 # --shm-size=16G: Increases shared memory
 # -v HF_HOME: Mounts HuggingFace cache to avoid re-downloading models
+
+# Force cleanup of the image to ensure we pull the absolute latest
+echo "Ensuring we have the latest image for ${DOCKER_IMAGE}..."
+docker rmi "${DOCKER_IMAGE}" > /dev/null 2>&1 || true
+docker pull "${DOCKER_IMAGE}"
+ 
+
+# Default to no gcloud mount
+GCLOUD_MOUNT_ARGS=()
+
+# However, if ~/.config/gcloud exists, mount it so the container inherits the host's auth state.
+if [ -d "$HOME/.config/gcloud" ]; then
+    GCLOUD_MOUNT_ARGS+=(-v "$HOME/.config/gcloud:/root/.config/gcloud")
+fi
+
 docker run \
     --privileged \
     --entrypoint /bin/bash \
@@ -100,5 +130,6 @@ docker run \
     --shm-size=16G \
     --name "${CONTAINER_NAME}" \
     -v "${PATH_TO_HF_HOME}:/root/.cache/huggingface" \
+    "${GCLOUD_MOUNT_ARGS[@]}" \
     "${ADDITIONAL_ARGS[@]}" \
     "${DOCKER_IMAGE}" -c "${RAY_START_CMD}"

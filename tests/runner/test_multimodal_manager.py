@@ -1,3 +1,17 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from unittest.mock import MagicMock, patch
 
 import jax
@@ -42,11 +56,12 @@ class TestMultiModalManager:
                 swap_space=4,
                 cache_dtype="auto",
             )
-            scheduler_config = SchedulerConfig(max_num_seqs=16, )
+            scheduler_config = SchedulerConfig(max_num_seqs=16,
+                                               max_model_len=1024,
+                                               is_encoder_decoder=False)
             parallel_config = ParallelConfig(
                 pipeline_parallel_size=1,
                 tensor_parallel_size=1,
-                worker_use_ray=False,
             )
             speculative_config = SpeculativeConfig(
                 model='ngram',
@@ -72,7 +87,7 @@ class TestMultiModalManager:
         # 1. ===== Setup =====
         self.runner.is_multimodal_model = True
         self.mock_get_mm_embed_fn = MagicMock()
-        self.runner.get_multimodal_embeddings_fn = self.mock_get_mm_embed_fn
+        self.runner.embed_multimodal_fn = self.mock_get_mm_embed_fn
 
         self.runner.state = MagicMock()
         # Mock scheduler output
@@ -82,12 +97,12 @@ class TestMultiModalManager:
         # Mock request state
         dummy_pixel_values = torch.randn(3, 224, 224, dtype=torch.bfloat16)
         dummy_grid_thw = torch.tensor([[1, 1, 1]], dtype=torch.int64)
-        mm_item = MultiModalKwargsItem.from_elems([
-            MultiModalFieldElem("image", "pixel_values", dummy_pixel_values,
-                                MultiModalBatchedField()),
-            MultiModalFieldElem("image", "image_grid_thw", dummy_grid_thw,
-                                MultiModalBatchedField())
-        ])
+        mm_item = MultiModalKwargsItem({
+            "pixel_values":
+            MultiModalFieldElem(dummy_pixel_values, MultiModalBatchedField()),
+            "image_grid_thw":
+            MultiModalFieldElem(dummy_grid_thw, MultiModalBatchedField())
+        })
 
         req_state = CachedRequestState(
             req_id="req-1",
@@ -123,7 +138,7 @@ class TestMultiModalManager:
         np.testing.assert_array_equal(np.asarray(cached_embedding),
                                       np.asarray(dummy_embedding))
 
-        # Check if get_multimodal_embeddings_fn was called with correct args
+        # Check if embed_multimodal_fn was called with correct args
         self.mock_get_mm_embed_fn.assert_called_once()
         call_args = self.mock_get_mm_embed_fn.call_args
 
@@ -142,8 +157,8 @@ class TestMultiModalManager:
         assert passed_pixel_values.dtype == jnp.bfloat16
 
         # Convert torch tensor for comparison
-        expected_pixel_values = dummy_pixel_values.unsqueeze(0).unsqueeze(
-            0).to(torch.float32).numpy().astype(jnp.bfloat16)
+        expected_pixel_values = dummy_pixel_values.unsqueeze(0).to(
+            torch.float32).numpy().astype(jnp.bfloat16)
         np.testing.assert_array_equal(np.asarray(passed_pixel_values),
                                       expected_pixel_values)
 
@@ -153,7 +168,7 @@ class TestMultiModalManager:
         # 1. ===== Setup =====
         self.runner.is_multimodal_model = True
         self.mock_get_mm_embed_fn = MagicMock()
-        self.runner.get_multimodal_embeddings_fn = self.mock_get_mm_embed_fn
+        self.runner.embed_multimodal_fn = self.mock_get_mm_embed_fn
 
         self.runner.state = MagicMock()
         # Mock scheduler output for two requests
@@ -167,12 +182,12 @@ class TestMultiModalManager:
         px_1 = torch.randn(3, 224, 224, dtype=torch.bfloat16)
         grid_1 = torch.tensor([[1, 1, 1]], dtype=torch.int64)
 
-        mm_item_1 = MultiModalKwargsItem.from_elems([
-            MultiModalFieldElem("image", "pixel_values", px_1,
-                                MultiModalBatchedField()),
-            MultiModalFieldElem("image", "image_grid_thw", grid_1,
-                                MultiModalBatchedField())
-        ])
+        mm_item_1 = MultiModalKwargsItem({
+            "pixel_values":
+            MultiModalFieldElem(px_1, MultiModalBatchedField()),
+            "image_grid_thw":
+            MultiModalFieldElem(grid_1, MultiModalBatchedField())
+        })
 
         req_state_1 = CachedRequestState(
             req_id="req-1",
@@ -194,12 +209,12 @@ class TestMultiModalManager:
 
         px_2 = torch.randn(3, 224, 224, dtype=torch.bfloat16)
         grid_2 = torch.tensor([[1, 2, 2]], dtype=torch.int64)
-        mm_item_2 = MultiModalKwargsItem.from_elems([
-            MultiModalFieldElem("image", "pixel_values", px_2,
-                                MultiModalBatchedField()),
-            MultiModalFieldElem("image", "image_grid_thw", grid_2,
-                                MultiModalBatchedField())
-        ])
+        mm_item_2 = MultiModalKwargsItem({
+            "pixel_values":
+            MultiModalFieldElem(px_2, MultiModalBatchedField()),
+            "image_grid_thw":
+            MultiModalFieldElem(grid_2, MultiModalBatchedField())
+        })
 
         req_state_2 = CachedRequestState(
             req_id="req-2",
@@ -247,11 +262,10 @@ class TestMultiModalManager:
         assert "pixel_values" in kwargs_arg
 
         passed_pixel_values = kwargs_arg['pixel_values']
-        assert passed_pixel_values.shape == (2, 1, 3, 224, 224)
+        assert passed_pixel_values.shape == (2, 3, 224, 224)
 
-        expected_pixel_values = torch.stack(
-            [px_1, px_2],
-            dim=0).unsqueeze(1).to(torch.float32).numpy().astype(jnp.bfloat16)
+        expected_pixel_values = torch.stack([px_1, px_2], dim=0).to(
+            torch.float32).numpy().astype(jnp.bfloat16)
         np.testing.assert_array_equal(np.asarray(passed_pixel_values),
                                       expected_pixel_values)
 

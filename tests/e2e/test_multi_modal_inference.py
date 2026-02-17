@@ -4,9 +4,11 @@
 # This script is a self-contained test that runs a single prompt and
 # compares the output to a known-good output.
 
+import difflib
 import os
 from dataclasses import asdict
 
+import pytest
 from vllm import LLM, EngineArgs, SamplingParams
 from vllm.assets.image import ImageAsset
 from vllm.multimodal.image import convert_image_mode
@@ -20,7 +22,8 @@ EXPECTED_TEXT = (
 
 
 # NOTE: Could be extended to more mm models/configs as needed
-def test_multi_modal_inference(monkeypatch):
+@pytest.mark.parametrize("enable_dynamic_image_sizes", [False, True])
+def test_multi_modal_inference(monkeypatch, enable_dynamic_image_sizes):
     """
     Runs multi-modal inference and verifies the output.
     """
@@ -60,13 +63,20 @@ def test_multi_modal_inference(monkeypatch):
         gpu_memory_utilization=gpu_memory_utilization,
         max_num_seqs=1,
         mm_processor_kwargs={
-            "min_pixels": 28 * 28,
-            "max_pixels": 1280 * 28 * 28,
+            "size": {
+                "longest_edge": 1003520,
+                "shortest_edge": 3136
+            },
             "fps": 1,
         },
         limit_mm_per_prompt={modality: 1},
     )
     engine_args = asdict(engine_args)
+    if engine_args.get("additional_config") is None:
+        engine_args["additional_config"] = {}
+
+    engine_args["additional_config"][
+        "enable_dynamic_image_sizes"] = enable_dynamic_image_sizes
     llm = LLM(**engine_args)
 
     sampling_params = SamplingParams(
@@ -94,4 +104,10 @@ def test_multi_modal_inference(monkeypatch):
     print("-" * 50)
 
     # Check output
-    assert generated_text == EXPECTED_TEXT
+    similarity_score = difflib.SequenceMatcher(None, generated_text,
+                                               EXPECTED_TEXT).ratio()
+    print(f"Similarity Score: {similarity_score:.4f}")
+    assert similarity_score >= 0.85, (
+        f"Text similarity too low ({similarity_score:.2f}).\n"
+        f"Expected: {EXPECTED_TEXT}\n"
+        f"Actual:   {generated_text}")

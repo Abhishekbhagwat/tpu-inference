@@ -1,3 +1,17 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import unittest
 from unittest.mock import MagicMock
 
@@ -5,7 +19,7 @@ import jax.numpy as jnp
 from flax import nnx
 
 from tpu_inference.layers.jax.layers import DenseFFW
-from tpu_inference.layers.jax.moe.moe import MoE
+from tpu_inference.layers.jax.moe.moe import JaxMoE
 from tpu_inference.layers.jax.transformer_block import (
     SharedExpertsTransformerBlock, TransformerBlock)
 
@@ -94,7 +108,7 @@ class TestTransformerBlock(unittest.TestCase):
         dummy_kv_cache = jnp.zeros((8, 16, 16, 128), dtype=jnp.bfloat16)
         mock_attn.return_value = (dummy_kv_cache, dummy_attn_output)
 
-        mock_moe = MagicMock(spec=MoE)
+        mock_moe = MagicMock(spec=JaxMoE)
         dummy_moe_output = jnp.full((64, hidden_size), 3.0, dtype=jnp.bfloat16)
         mock_moe.return_value = dummy_moe_output
 
