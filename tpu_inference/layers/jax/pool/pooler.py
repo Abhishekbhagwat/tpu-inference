@@ -49,13 +49,9 @@ class ResolvedPoolingConfig:
         else:
             raise ValueError(f"Unsupported pooling task: {task}")
 
-        pooling_type_str = pooler_config.pooling_type or default_pooling_type.name
+        pooling_type_str = pooler_config.seq_pooling_type or default_pooling_type.name
         pooling_type = PoolingType(pooling_type_str.upper())
-        normalize = (
-            pooler_config.normalize
-            if pooler_config.normalize is not None
-            else default_normalize
-        )
+        normalize = default_normalize
 
         return cls(task=task, pooling_type=pooling_type, normalize=normalize)
 
