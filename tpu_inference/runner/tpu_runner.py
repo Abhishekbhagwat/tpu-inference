@@ -58,6 +58,8 @@ from tpu_inference.layers.jax.sample.sampling import (compute_logprobs,
                                                       gather_logprobs, sample)
 from tpu_inference.layers.jax.sample.sampling_metadata import \
     TPUSupportedSamplingMetadata
+from tpu_inference.layers.jax.pool.pooling import pool
+from tpu_inference.layers.jax.pool.pooler import Pooler as JaxPooler
 from tpu_inference.layers.jax.pool.pooling_metadata import (
     TPUSupportedPoolingMetadata,
 )
@@ -823,15 +825,20 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 return hidden_states
 
             if self.is_pooling_model:
-                seq_lens = self.seq_lens_cpu[:self.input_batch.num_reqs]
-                pooling_metadata = self.input_batch.get_pooling_metadata()
-
-                pooler_fn: PoolerFunc = self.pooler_fn
-                pooler_output = pooler_fn(
-                    hidden_states,
-                    pooling_metadata,
-                    seq_lens,
-                )
+                if isinstance(getattr(self, 'pooler', None), JaxPooler):
+                    # Use JAX pool() with TPUSupportedPoolingMetadata
+                    # from _prepare_inputs (already in pooling_metadata).
+                    pooler_output = pool(
+                        hidden_states, pooling_metadata, self.pooler)
+                else:
+                    seq_lens = self.seq_lens_cpu[:self.input_batch.num_reqs]
+                    pooling_metadata = self.input_batch.get_pooling_metadata()
+                    pooler_fn: PoolerFunc = self.pooler_fn
+                    pooler_output = pooler_fn(
+                        hidden_states,
+                        pooling_metadata,
+                        seq_lens,
+                    )
 
                 return ModelRunnerOutput(
                     req_ids=self.input_batch.req_ids,
