@@ -847,8 +847,45 @@ class LoadableWithIterator:
             # Use next parent class in MRO.
             return super().load_weights(weights)
 
+        weights = self._maybe_add_model_prefix(weights)
+
         loader = JaxAutoWeightsLoader(
             self,
             skip_prefixes=(["lm_head"]
                            if not hasattr(self, 'lm_head') else None))
         return loader.load_weights(weights)
+
+    def _maybe_add_model_prefix(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """Add ``model.`` prefix when checkpoint keys omit it.
+
+        Some HuggingFace checkpoints (e.g. sentence-transformer /
+        embedding models) store weights without the ``model.`` prefix
+        while the JAX module nests them under ``self.model``.  Detect
+        this by peeking at the first weight name and, if needed, stream
+        the prefix through without materialising the full iterator.
+        """
+        if not hasattr(self, "model"):
+            return weights
+
+        weights_iter = iter(weights)
+        try:
+            first_name, first_tensor = next(weights_iter)
+        except StopIteration:
+            return iter([])
+
+        needs_prefix = not first_name.startswith("model.")
+
+        if not needs_prefix:
+            # Re-attach the first element we consumed.
+            def _passthrough():
+                yield first_name, first_tensor
+                yield from weights_iter
+            return _passthrough()
+
+        def _prefixed():
+            yield (f"model.{first_name}", first_tensor)
+            for name, tensor in weights_iter:
+                yield (f"model.{name}", tensor)
+        return _prefixed()
