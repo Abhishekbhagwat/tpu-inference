@@ -2035,3 +2035,14 @@ class Qwen3VLForConditionalGeneration(nnx.Module):
             metadata_map=metadata_map,
             mesh=self.mesh,
         )
+
+        # Some embedding checkpoints set tie_word_embeddings=false in config
+        # but omit lm_head.weight from the checkpoint. If lm_head is still
+        # abstract after loading, tie it to embed_tokens as a fallback.
+        if not hf_config.tie_word_embeddings:
+            lm_head = self.language_model.lm_head
+            if isinstance(getattr(lm_head, "value", lm_head), jax.ShapeDtypeStruct):
+                logger.warning(
+                    "lm_head.weight not found in checkpoint; tying to embed_tokens.")
+                self.language_model.lm_head = self.language_model.embed.embedding
+                self.language_model.tie_word_embeddings = True
