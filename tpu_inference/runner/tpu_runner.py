@@ -828,8 +828,13 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 if isinstance(getattr(self, 'pooler', None), JaxPooler):
                     # Use JAX pool() with TPUSupportedPoolingMetadata
                     # from _prepare_inputs (already in pooling_metadata).
-                    pooler_output = pool(
+                    pooled = pool(
                         hidden_states, pooling_metadata, self.pooler)
+                    # Convert [padded_num_reqs, dim] JAX array to a list
+                    # of per-request numpy arrays for the vLLM scheduler.
+                    num_reqs = self.input_batch.num_reqs
+                    pooled_np = np.asarray(pooled[:num_reqs])
+                    pooler_output = [pooled_np[i] for i in range(num_reqs)]
                 else:
                     seq_lens = self.seq_lens_cpu[:self.input_batch.num_reqs]
                     pooling_metadata = self.input_batch.get_pooling_metadata()
