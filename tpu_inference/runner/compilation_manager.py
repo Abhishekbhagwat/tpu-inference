@@ -25,6 +25,7 @@ import tpu_inference.envs as envs
 from tpu_inference.core.disagg_utils import is_disagg_enabled
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.common.sharding import ShardingAxisName
+from tpu_inference.layers.jax.pool.pooler import Pooler
 from tpu_inference.layers.jax.pool.pooling import pool
 from tpu_inference.layers.jax.pool.pooling_metadata import (
     TPUSupportedPoolingMetadata,
@@ -126,6 +127,12 @@ class CompilationManager:
         if pooler is None:
             logger.warning(
                 "Pooling precompile skipped because model has no pooler attribute.")
+            return
+
+        if not isinstance(pooler, Pooler):
+            logger.info(
+                "Pooling precompile skipped for non-JAX pooler (%s).",
+                type(pooler).__name__)
             return
 
         logger.info("Precompile pooling kernels for pooling models.")
