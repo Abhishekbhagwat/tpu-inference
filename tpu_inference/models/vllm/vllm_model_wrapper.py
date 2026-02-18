@@ -200,6 +200,7 @@ class VllmModelWrapper:
         params_and_buffers = shard_model_to_tpu(self.model, self.mesh)
 
         self._pooler: Pooler | None = self.model.pooler
+        self.pooler = self._pooler
 
         loading_end = time.time()
         total_loading_time = loading_end - loading_start
