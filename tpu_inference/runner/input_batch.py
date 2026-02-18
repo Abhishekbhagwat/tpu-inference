@@ -291,11 +291,6 @@ class InputBatch:
         self.min_tokens.pop(req_index, None)
         self.generators.pop(req_index, None)
         self.num_logprobs.pop(req_id, None)
-        if self.is_pooling_model:
-            self.pooling_params.pop(req_id, None)
-            return req_index
-
-        # It's ok to pop nothing for non-pooling model.
         self.pooling_params.pop(req_id, None)
         self.pooling_states.pop(req_id, None)
 

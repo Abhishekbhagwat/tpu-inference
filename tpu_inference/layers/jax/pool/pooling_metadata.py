@@ -27,7 +27,7 @@ def build_pooling_cursor(
     padded_num_scheduled_tokens = padded_num_scheduled_tokens.at[:n_seq].set(
         jnp.asarray(num_scheduled_tokens, dtype=jnp.int32)
     )
-    cumsum = jnp.cumsum(padded_num_scheduled_tokens, dtype = jnp.int64)
+    cumsum = jnp.cumsum(padded_num_scheduled_tokens, dtype=jnp.int64)
     first_token_indices = jnp.concatenate((jnp.asarray((0,)), cumsum[:-1]))
     last_token_indices = (first_token_indices + padded_num_scheduled_tokens - 1).astype(jnp.int64)
     last_token_indices = jnp.where(
@@ -44,7 +44,7 @@ def build_pooling_cursor(
         "last_token_indices",
         "num_scheduled_tokens", 
     ),
-    meta_fields = (),
+    meta_fields=(),
 )
 @dataclass
 class TPUSupportedPoolingMetadata:
@@ -69,8 +69,8 @@ class TPUSupportedPoolingMetadata:
         assert len(pooling_params_list) == num_reqs
         assert len(input_batch.num_prompt_tokens[:num_reqs]) == len(padded_num_scheduled_tokens)
 
-        padded_prompt_lens= jnp.zeros(padded_num_reqs, dtype=np.int32)
-        padded_prompt_lens= padded_prompt_lens.at[:num_reqs].set(input_batch.num_prompt_tokens[:num_reqs])
+        padded_prompt_lens = jnp.zeros(padded_num_reqs, dtype=np.int32)
+        padded_prompt_lens = padded_prompt_lens.at[:num_reqs].set(input_batch.num_prompt_tokens[:num_reqs])
 
         first_token_indices, last_token_indices, padded_num_scheduled_tokens = build_pooling_cursor(
             padded_num_scheduled_tokens, padded_num_reqs
@@ -81,12 +81,12 @@ class TPUSupportedPoolingMetadata:
             (padded_prompt_lens, first_token_indices, last_token_indices, padded_num_scheduled_tokens),
         )
 
-        #everything in pooling_metadata is padded.
+        # Everything in pooling_metadata is padded.
         return cls(
             prompt_lens=prompt_lens,
             first_token_indices=first_token_indices,
             last_token_indices=last_token_indices,
-            num_scheduled_tokens = num_scheduled_tokens,
+            num_scheduled_tokens=num_scheduled_tokens,
         )
 
 

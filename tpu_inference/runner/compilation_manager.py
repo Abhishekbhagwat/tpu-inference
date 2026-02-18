@@ -123,7 +123,7 @@ class CompilationManager:
                 self._precompile_speculative_decoding()
 
     def _precompile_pooling(self) -> None:
-        pooler = getattr(self.runner, "pooler", None)
+        pooler = getattr(self.runner, '_jax_pooler', None)
         if pooler is None:
             logger.warning(
                 "Pooling precompile skipped because model has no pooler attribute.")
@@ -151,17 +151,16 @@ class CompilationManager:
                     continue
 
                 # can we just use (one array here)
-                prompt_lens = self._create_dummy_tensor(num_reqs, dtype = jnp.int32) 
-                first_token_indices = self._create_dummy_tensor(num_reqs, dtype = jnp.int32) 
-                last_token_indices = self._create_dummy_tensor(num_reqs, dtype = jnp.int32) 
-                num_scheduled_tokens = self._create_dummy_tensor(num_reqs, dtype = jnp.int32) 
-
+                prompt_lens = self._create_dummy_tensor(num_reqs, dtype=jnp.int32)
+                first_token_indices = self._create_dummy_tensor(num_reqs, dtype=jnp.int32)
+                last_token_indices = self._create_dummy_tensor(num_reqs, dtype=jnp.int32)
+                num_scheduled_tokens = self._create_dummy_tensor(num_reqs, dtype=jnp.int32)
 
                 pooling_metadata = TPUSupportedPoolingMetadata(
                     prompt_lens=prompt_lens,
                     first_token_indices=first_token_indices,
                     last_token_indices=last_token_indices,
-                    num_scheduled_tokens = num_scheduled_tokens,
+                    num_scheduled_tokens=num_scheduled_tokens,
                 )
 
                 self._run_compilation(

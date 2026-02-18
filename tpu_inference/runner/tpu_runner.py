@@ -24,7 +24,6 @@ import jax
 import jax.numpy as jnp
 import jaxtyping
 import numpy as np
-import torch
 import vllm.envs as vllm_envs
 from flax import nnx
 from jax.experimental import mesh_utils
@@ -59,13 +58,10 @@ from tpu_inference.layers.jax.sample.sampling import (compute_logprobs,
                                                       gather_logprobs, sample)
 from tpu_inference.layers.jax.sample.sampling_metadata import \
     TPUSupportedSamplingMetadata
-from tpu_inference.layers.jax.pool.pooling import pool
-from tpu_inference.layers.jax.pool.pooler import Pooler as JaxPooler
 from tpu_inference.layers.jax.pool.pooling_metadata import (
     TPUSupportedPoolingMetadata,
 )
 from tpu_inference.logger import init_logger
-from tpu_inference.models.common.interface import PoolerFunc
 from tpu_inference.models.common.model_loader import get_model
 from tpu_inference.models.jax.jax_intermediate_tensor import \
     JaxIntermediateTensors
@@ -254,7 +250,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self.is_last_rank = is_last_rank
 
         self.is_pooling_model = self.model_config.runner_type == "pooling"
-        self.pooler = None
+        self._jax_pooler = None
 
         self._init_random()
         self._init_mesh()
@@ -521,7 +517,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                                             dtype=np.int64)
 
     def load_model(self):
-        self.model_fn, self.compute_logits_fn, self.pooler_fn, self.combine_hidden_states_fn, multimodal_fns, self.state, self.lora_manager, self.model = get_model(
+        self.model_fn, self.compute_logits_fn, self.pooler_fn, self.combine_hidden_states_fn, multimodal_fns, self.state, self.lora_manager, model_ref = get_model(
             self.vllm_config,
             self.rng_key,
             self.mesh,
@@ -530,7 +526,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         multimodal_fns = multimodal_fns or {}
 
         if self.is_pooling_model:
-            self.pooler = self.model.pooler
+            self._jax_pooler = model_ref
 
         self.precompile_vision_encoder_fn = multimodal_fns.get(
             "precompile_vision_encoder_fn", None)
@@ -826,26 +822,14 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 return hidden_states
 
             if self.is_pooling_model:
-                if isinstance(getattr(self, 'pooler', None), JaxPooler):
-                    # Use JAX pool() with TPUSupportedPoolingMetadata
-                    # from _prepare_inputs (already in pooling_metadata).
-                    pooled = pool(
-                        hidden_states, pooling_metadata, self.pooler)
-                    # Convert [padded_num_reqs, dim] JAX array to a list
-                    # of per-request torch tensors for the vLLM scheduler.
-                    num_reqs = self.input_batch.num_reqs
-                    pooled_np = np.asarray(pooled[:num_reqs])
-                    pooler_output = [
-                        torch.from_numpy(pooled_np[i])
-                        for i in range(num_reqs)
-                    ]
+                if self._jax_pooler is not None:
+                    pooler_output = self.pooler_fn(
+                        hidden_states, pooling_metadata)
                 else:
                     seq_lens = self.seq_lens_cpu[:self.input_batch.num_reqs]
-                    pooling_metadata = self.input_batch.get_pooling_metadata()
-                    pooler_fn: PoolerFunc = self.pooler_fn
-                    pooler_output = pooler_fn(
+                    pooler_output = self.pooler_fn(
                         hidden_states,
-                        pooling_metadata,
+                        self.input_batch.get_pooling_metadata(),
                         seq_lens,
                     )
 

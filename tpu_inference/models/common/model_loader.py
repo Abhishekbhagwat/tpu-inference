@@ -16,6 +16,7 @@ import functools
 from typing import Any, Optional
 
 import jax
+import numpy as np
 import torch
 from flax import nnx
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
@@ -247,7 +248,6 @@ def _not_support(*args, **kwargs):
     raise NotImplementedError("The action on this path is not supported yet.")
 
 
-
 # TODO(pooyam): We need to refactor this. This is returning a bunch of functions that do not work with all models and this is not very easy to see from the code.
 def get_flax_model(
     vllm_config: VllmConfig,
@@ -353,9 +353,22 @@ def get_flax_model(
     compute_logits_fn = functools.partial(run_compute_logits, graphdef)
     embed_multimodal_fn = functools.partial(run_embed_multimodal, graphdef)
     embed_input_ids_fn = functools.partial(run_embed_input_ids, graphdef)
-    lora_manager = None
-    if not getattr(jit_model, 'is_pooling_model', False):
-        model = None
+
+    pooler_fn = _not_support
+    _jax_pooler = None
+    if getattr(jit_model, 'is_pooling_model', False):
+        from tpu_inference.layers.jax.pool.pooling import pool
+        _jax_pooler = model.pooler
+
+        def jax_pooler_fn(hidden_states, pooling_metadata, seq_lens=None):
+            pooled = pool(hidden_states, pooling_metadata, _jax_pooler)
+            num_reqs = pooling_metadata.prompt_lens.shape[0]
+            pooled_np = np.asarray(pooled[:num_reqs])
+            return [torch.from_numpy(pooled_np[i]) for i in range(num_reqs)]
+
+        pooler_fn = jax_pooler_fn
+
+    lora_manager, model = None, None
     combine_hidden_states_fn = functools.partial(combine_hidden_states,
                                                  graphdef)
 
@@ -370,7 +383,7 @@ def get_flax_model(
         "get_mrope_input_positions_fn": get_mrope_input_positions_fn,
     }
 
-    return model_fn, compute_logits_fn, _not_support, combine_hidden_states_fn, multimodal_fns, state, lora_manager, model
+    return model_fn, compute_logits_fn, pooler_fn, combine_hidden_states_fn, multimodal_fns, state, lora_manager, _jax_pooler
 
 
 def get_vllm_model(

@@ -101,7 +101,6 @@ class VllmModelWrapper:
     rng: PRNGKey
     mesh: Mesh
     model: _VllmRunner
-    pooler: Pooler
 
     def __init__(self, vllm_config: VllmConfig, rng: PRNGKey, mesh: Mesh):
         self.vllm_config = vllm_config
@@ -200,7 +199,6 @@ class VllmModelWrapper:
         params_and_buffers = shard_model_to_tpu(self.model, self.mesh)
 
         self._pooler: Pooler | None = self.model.pooler
-        self.pooler = self._pooler
 
         loading_end = time.time()
         total_loading_time = loading_end - loading_start

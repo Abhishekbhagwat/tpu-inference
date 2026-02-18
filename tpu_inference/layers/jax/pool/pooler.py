@@ -108,7 +108,7 @@ class MeanPoolingMethod(PoolingMethod):
         padded_prompt_lens = pooling_metadata.prompt_lens
         padded_start_indices = pooling_metadata.first_token_indices
         padded_end_indices = pooling_metadata.last_token_indices
-        cumsum = jnp.cumsum(hidden_states, axis = 0, dtype=jnp.float32)
+        cumsum = jnp.cumsum(hidden_states, axis=0, dtype=jnp.float32)
 
         return (
             cumsum[padded_end_indices]
@@ -222,11 +222,11 @@ class EmbeddingPooler(Pooler):
         pooling: PoolingMethod,
         head: EmbeddingPoolerHead,
     ) -> None:
-        self.pooling = pooling 
-        self.head = head 
+        self.pooling = pooling
+        self.head = head
 
     @classmethod
-    def from_config(cls, config: ResolvedPoolingConfig) -> None:
+    def from_config(cls, config: ResolvedPoolingConfig) -> "EmbeddingPooler":
         pooling = PoolingMethod.from_pooling_type(config.pooling_type)
         head = EmbeddingPoolerHead(config.normalize)
         return cls(pooling, head)
@@ -237,12 +237,11 @@ class EmbeddingPooler(Pooler):
         pooling_metadata: TPUSupportedPoolingMetadata,
     ) -> PoolerOutput:
         hidden_states = hidden_states.astype(jnp.float32)
-        # the output mus be of type torch.tensor, but we cannot convert numpy to torch if the dtype is bf16
         pooled = self.pooling(hidden_states, pooling_metadata)
         return self.head(pooled, pooling_metadata)
 
     def get_supported_tasks(self) -> set[str]:
-        return ("embed",)
+        return {"embed"}
 
 
 def normalize(embeddings: jax.Array) -> jax.Array:
