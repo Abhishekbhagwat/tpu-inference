@@ -24,6 +24,7 @@ import jax
 import jax.numpy as jnp
 import jaxtyping
 import numpy as np
+import torch
 import vllm.envs as vllm_envs
 from flax import nnx
 from jax.experimental import mesh_utils
@@ -831,10 +832,13 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     pooled = pool(
                         hidden_states, pooling_metadata, self.pooler)
                     # Convert [padded_num_reqs, dim] JAX array to a list
-                    # of per-request numpy arrays for the vLLM scheduler.
+                    # of per-request torch tensors for the vLLM scheduler.
                     num_reqs = self.input_batch.num_reqs
                     pooled_np = np.asarray(pooled[:num_reqs])
-                    pooler_output = [pooled_np[i] for i in range(num_reqs)]
+                    pooler_output = [
+                        torch.from_numpy(pooled_np[i])
+                        for i in range(num_reqs)
+                    ]
                 else:
                     seq_lens = self.seq_lens_cpu[:self.input_batch.num_reqs]
                     pooling_metadata = self.input_batch.get_pooling_metadata()
