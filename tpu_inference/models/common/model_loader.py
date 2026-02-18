@@ -345,7 +345,9 @@ def get_flax_model(
     compute_logits_fn = functools.partial(run_compute_logits, graphdef)
     embed_multimodal_fn = functools.partial(run_embed_multimodal, graphdef)
     embed_input_ids_fn = functools.partial(run_embed_input_ids, graphdef)
-    lora_manager, model = None, None
+    lora_manager = None
+    if not getattr(jit_model, 'is_pooling_model', False):
+        model = None
     combine_hidden_states_fn = functools.partial(combine_hidden_states,
                                                  graphdef)
 
