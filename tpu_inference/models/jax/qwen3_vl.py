@@ -1146,7 +1146,7 @@ class Qwen3VLVisionTransformer(nnx.Module):
         self.rotary_pos_emb = Qwen3VLVisionRotaryEmbedding(head_dim // 2)
 
         intermediate_size = vision_config.intermediate_size
-        self.blocks = [
+        self.blocks = nnx.List([
             Qwen3VLVisionBlock(
                 hidden_size=self.hidden_size,
                 num_heads=self.num_heads,
@@ -1157,7 +1157,7 @@ class Qwen3VLVisionTransformer(nnx.Module):
                 norm_eps=norm_eps,
             )
             for _ in range(vision_config.depth)
-        ]
+        ])
 
         # Final merger settings
         # Qwen3VLConfig uses text_config for text model hidden_size
@@ -1178,7 +1178,7 @@ class Qwen3VLVisionTransformer(nnx.Module):
         self.deepstack_visual_indexes = getattr(
             vision_config, "deepstack_visual_indexes", [8, 16, 24]
         )
-        self.deepstack_merger_list = [
+        self.deepstack_merger_list = nnx.List([
             Qwen3VLVisionPatchMerger(
                 d_model=out_hidden_size,
                 context_dim=self.hidden_size,
@@ -1189,7 +1189,7 @@ class Qwen3VLVisionTransformer(nnx.Module):
                 norm_eps=norm_eps,
             )
             for _ in range(len(self.deepstack_visual_indexes))
-        ]
+        ])
 
         additional_config = getattr(vllm_config, "additional_config", None) or {}
         self.enable_dynamic_image_sizes = additional_config.get(
@@ -1482,7 +1482,7 @@ class Qwen3VLModel(nnx.Module):
         )
 
         # Decoder layers with MRoPE support and KV cache attention
-        self.layers = [
+        self.layers = nnx.List([
             Qwen3VLTextDecoderLayer(
                 config=text_config,
                 dtype=dtype,
@@ -1491,7 +1491,7 @@ class Qwen3VLModel(nnx.Module):
                 kv_cache_dtype=vllm_config.cache_config.cache_dtype,
             )
             for _ in range(text_config.num_hidden_layers)
-        ]
+        ])
 
         self.norm = Qwen3VLTextRMSNorm(
             hidden_size,

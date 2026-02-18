@@ -442,7 +442,7 @@ class Qwen3VLMoeTextModel(nnx.Module):
         )
 
         # layer idx govern layer type
-        self.layers = [
+        self.layers = nnx.List([
             Qwen3VLMoeTextDecoderLayer(
                 config=config,
                 layer_idx=layer_idx,
@@ -452,7 +452,7 @@ class Qwen3VLMoeTextModel(nnx.Module):
                 kv_cache_dtype=kv_cache_dtype,
             )
             for layer_idx in range(num_hidden_layers)
-        ]
+        ])
 
         self.norm = Qwen3VLTextRMSNorm(
             hidden_size,
